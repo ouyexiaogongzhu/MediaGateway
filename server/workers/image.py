@@ -44,15 +44,12 @@ def _png_size(path: Path) -> tuple[int, int]:
 
 
 def _resolve_model(variant) -> str:
-    """params["variant"]: 4b（默认）/ 9b / 9b-base；IRIS_MODEL_DIR 仍可整体覆盖 4b 路径。"""
-    if not variant or variant == "4b":
-        return os.environ.get("IRIS_MODEL_DIR", DEFAULT_MODEL)
-    d = _VARIANT_DIRS.get(variant)
-    if not d:
-        raise ValueError(f"unknown model variant: {variant} (known: {sorted(_VARIANT_DIRS)})")
-    if not os.path.isdir(d):
-        raise ValueError(f"model variant not downloaded: {variant} ({d})")
-    return d
+    """params["variant"]: 显式 4b/9b/9b-base；缺省用 IRIS_MODEL_DIR（ops 可整体切 9b），再缺省 4b。"""
+    if variant in ("9b", "9b-base"):
+        return _VARIANT_DIRS[variant]
+    if variant == "4b":
+        return DEFAULT_MODEL
+    return os.environ.get("IRIS_MODEL_DIR", DEFAULT_MODEL)
 
 
 def run(params: dict, job_dir: Path, progress, cancel) -> dict:
