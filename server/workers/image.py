@@ -1,4 +1,4 @@
-"""Image worker: iris.c CLI (flux-klein-4b, Metal GPU) — txt2img / img2img.
+"""Image worker: iris.c CLI (flux-klein-9b, Metal GPU) — txt2img / img2img.
 
 Measured (docs/tools.md): 1024px / 4 steps ≈ 67s, 10.8GB RSS.
 Phase 5 calls the CLI via subprocess; libiris.dylib FFI is a later optimization.
@@ -17,12 +17,11 @@ TYPE = "image"
 MEM_GB = 11.0
 
 DEFAULT_BIN = "/Users/vincent/tool/iris.c/iris"
-DEFAULT_MODEL = "/Users/vincent/tool/iris.c/flux-klein-4b"
+DEFAULT_MODEL = "/Users/vincent/tool/iris.c/flux-klein-9b"
 DEFAULT_TIMEOUT = 600.0
 
-# params["variant"] 按任务选模型档（9B 非商用 NCL 许可，内部工具用）
+# params["variant"] 按任务选模型档（9B 非商用 NCL 许可，内部工具用；4B 已下线删除）
 _VARIANT_DIRS = {
-    "4b": DEFAULT_MODEL,
     "9b": "/Users/vincent/tool/iris.c/flux-klein-9b",
     "9b-base": "/Users/vincent/tool/iris.c/flux-klein-9b-base",
 }
@@ -44,11 +43,11 @@ def _png_size(path: Path) -> tuple[int, int]:
 
 
 def _resolve_model(variant) -> str:
-    """params["variant"]: 显式 4b/9b/9b-base；缺省用 IRIS_MODEL_DIR（ops 可整体切 9b），再缺省 4b。"""
-    if variant in ("9b", "9b-base"):
+    """params["variant"]: 显式 9b/9b-base；缺省用 IRIS_MODEL_DIR（ops 可整体切档），再缺省 9b。"""
+    if variant in _VARIANT_DIRS:
         return _VARIANT_DIRS[variant]
-    if variant == "4b":
-        return DEFAULT_MODEL
+    if variant:
+        raise ValueError(f"unknown model variant: {variant} (known: {sorted(_VARIANT_DIRS)})")
     return os.environ.get("IRIS_MODEL_DIR", DEFAULT_MODEL)
 
 

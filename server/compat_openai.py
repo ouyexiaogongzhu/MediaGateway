@@ -53,7 +53,7 @@ class ImageGenIn(BaseModel):
     size: Optional[str] = None
     n: int = 1
     seed: Optional[int] = None
-    variant: Optional[str] = None  # 4b | 9b | 9b-base
+    variant: Optional[str] = None  # 9b | 9b-base
 
 
 def _parse_size(size: Optional[str]) -> tuple[int, int]:
@@ -128,7 +128,7 @@ async def images_edits(
     size: Optional[str] = Form(None),
     n: int = Form(1),
     seed: Optional[int] = Form(None),
-    variant: Optional[str] = Form(None),  # 4b | 9b | 9b-base
+    variant: Optional[str] = Form(None),  # 9b | 9b-base
     image: list[UploadFile] = File([]),
     mask: Optional[UploadFile] = File(None),
 ):
