@@ -17,8 +17,11 @@ Documented diffs vs the frozen h3cweb server:
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
+import urllib.parse
+import urllib.request
 import uuid
 from typing import List, Optional
 
@@ -61,6 +64,8 @@ class JobRequest(BaseModel):
     output_path: Optional[str] = None
     ssd_streaming: bool = False
     reference_image_size: Optional[int] = None
+    first_frame: Optional[str] = None
+    mute_audio: bool = False
 
 
 def _resolve(path: str) -> str:
@@ -178,13 +183,92 @@ def _save_data_url(text: str, kind: str = "image") -> Optional[str]:
     return path
 
 
+_MAX_IMAGE_BYTES = 64 * 1024 * 1024
+
+
+def _looks_like_image(head: bytes) -> bool:
+    """Magic bytes: jpeg / png / gif / bmp / webp / isobox(avif,heif)。"""
+    return (head[:3] == b"\xff\xd8\xff"
+            or head[:8] == b"\x89PNG\r\n\x1a\n"
+            or head[:4] in (b"GIF8", b"BM")
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+            or head[4:8] == b"ftyp")
+
+
+def _fetch_url(url: str) -> str:
+    """Download an http(s) image into REFS_DIR (same naming scheme as data URLs).
+
+    scheme 白名单由调用方保证；此处复查重定向终点，限 64MB，验 magic bytes。"""
+    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".png"
+    os.makedirs(REFS_DIR, exist_ok=True)
+    path = os.path.join(REFS_DIR, f"ref_{uuid.uuid4().hex[:8]}{ext}")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r, open(path, "wb") as f:
+            final = str(r.geturl())
+            if not final.startswith(("http://", "https://")):
+                raise ValueError(f"重定向到非 http(s) 协议: {final}")
+            head = r.read(16)
+            if not _looks_like_image(head):
+                raise ValueError(f"内容不是图片 (Content-Type: "
+                                 f"{r.headers.get('Content-Type')})")
+            f.write(head)
+            total = len(head)
+            while chunk := r.read(1 << 20):
+                total += len(chunk)
+                if total > _MAX_IMAGE_BYTES:
+                    raise ValueError(f"图片超过 {_MAX_IMAGE_BYTES >> 20}MB 上限")
+                f.write(chunk)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"拉取图片失败: {url}: {e}")
+    return path
+
+
+def _localize_image(val) -> str:
+    """first_frame_image/input_images entries: data URL | http(s) URL | local path → path."""
+    val = str(val).strip()
+    path = _save_data_url(val)
+    if path:
+        return path
+    if val.startswith(("http://", "https://")):
+        return _fetch_url(val)
+    if os.path.isabs(val) and os.path.isfile(val):
+        return val
+    raise HTTPException(
+        400, f"图片引用必须是 data URL、http(s) URL 或已存在的绝对路径: {val[:80]}")
+
+
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("true", "1", "yes")
+
+
+def _input_image_values(entries) -> list:
+    """input_images: repeated form fields or one JSON-array string → flat paths.
+    空条目（None / 空串 / 纯空白，含数组内部）一律跳过。"""
+    vals = [e for e in (entries or []) if e is not None]
+    if len(vals) == 1 and str(vals[0]).lstrip().startswith("["):
+        try:
+            vals = json.loads(str(vals[0]))
+        except ValueError:
+            raise HTTPException(400, "input_images 不是合法的 JSON 数组")
+    if not isinstance(vals, list):
+        vals = [vals]
+    return [_localize_image(v) for v in vals
+            if v is not None and str(v).strip()]
+
+
 @router.post("/v1/videos")
 async def openai_create_video(request: Request):
     """Accept JSON (Sora API style) and multipart (canvas OpenAI preset)."""
     ct = request.headers.get("content-type", "")
     ref_paths: list[str] = []
+    first_frame: Optional[str] = None
+    mute_audio = False
     if ct.startswith("multipart/") or ct.startswith("application/x-www-form"):
-        form = await request.form()
+        # 影策把分镜图整张编码成 input_images 文本字段（>1MB）：
+        # starlette 对非文件 part 默认 1MB 上限，会 400 "Part exceeded maximum size"
+        form = await request.form(max_part_size=64 << 20)
         for key in ("audios", "reference_audios", "audio_url", "videos",
                     "reference_videos", "video_url"):
             if form.get(key):
@@ -198,6 +282,12 @@ async def openai_create_video(request: Request):
             with open(path, "wb") as f:
                 f.write(await up.read())
             ref_paths.append(path)
+        # 影策/newapi: input_images 多值（重复字段名或单字段 JSON 数组字符串）
+        ref_paths += _input_image_values(form.getlist("input_images"))
+        ffi = form.get("first_frame_image")
+        if ffi is not None and str(ffi).strip():
+            first_frame = _localize_image(ffi)
+        mute_audio = _as_bool(form.get("mute_audio"))
     else:
         try:
             raw = await request.json()
@@ -221,6 +311,11 @@ async def openai_create_video(request: Request):
                     ref_paths.append(path)
         if offered and not ref_paths:
             raise HTTPException(400, "reference images not data URLs")
+        ref_paths += _input_image_values(raw.get("input_images"))
+        ffi = raw.get("first_frame_image")
+        if ffi is not None and str(ffi).strip():
+            first_frame = _localize_image(ffi)
+        mute_audio = _as_bool(raw.get("mute_audio"))
     prompt = re.sub(r"\s*\[IMAGE_\d+\]", "", str(raw.get("prompt") or "")).strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")
@@ -274,7 +369,8 @@ async def openai_create_video(request: Request):
              + [Ref(kind="audio", path=p) for p in audio_paths],  # 先圖後音頻
         # keep reference conditioning at native res (up to 2048px), not
         # stretched down to the render canvas
-        reference_image_size=1 if ref_paths else 0))
+        reference_image_size=1 if ref_paths else 0,
+        first_frame=first_frame, mute_audio=mute_audio))
     return {"id": resp["job_id"], "task_id": resp["job_id"], "status": "queued"}
 
 

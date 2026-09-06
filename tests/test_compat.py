@@ -3,6 +3,7 @@
 Run: .venv/bin/python tests/test_compat.py
 """
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -97,22 +98,23 @@ def test_jobs_404(client):
 
 def test_v1_videos_json(client):
     data_url = "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
+    before = set(os.listdir(compat.REFS_DIR))
     r = client.post("/v1/videos", json={
         "prompt": "a [IMAGE_1] scene", "size": "512×288", "seconds": "2",
         "input_reference": [data_url]})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["id"] == body["task_id"] and body["status"] == "queued"
-    saved = [f for f in os.listdir(compat.REFS_DIR)
-             if f.startswith("ref_") and f.endswith(".png")]
-    assert saved, os.listdir(compat.REFS_DIR)
-    assert Path(compat.REFS_DIR, saved[0]).read_bytes() == b"PNGDATA"
+    new_files = [f for f in os.listdir(compat.REFS_DIR)
+                 if f.startswith("ref_") and f.endswith(".png") and f not in before]
+    assert new_files, os.listdir(compat.REFS_DIR)
+    assert Path(compat.REFS_DIR, new_files[0]).read_bytes() == b"PNGDATA"
     p = core.get_job(body["id"])["params"]
     assert p["prompt"] == "a scene"  # [IMAGE_N] stripped
     assert p["width"] == 512 and p["height"] == 288  # × normalized, already /32
     assert p["seconds"] == 2.0
     assert p["reference_image_size"] == 1
-    assert p["refs"][0]["path"] == os.path.join(compat.REFS_DIR, saved[0])
+    assert p["refs"][0]["path"] == os.path.join(compat.REFS_DIR, new_files[0])
 
 
 def test_v1_videos_size_rounding(client):
@@ -145,6 +147,76 @@ def test_v1_videos_multipart(client):
     assert p["reference_image_size"] == 1
 
 
+def _jpeg(b: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(b).decode()
+
+
+def test_v1_videos_multipart_input_images(client):
+    """影策协议：input_images 多值（重复字段名 / 单字段 JSON 数组字符串）全进 refs。"""
+    d1, d2 = _jpeg(b"IMG1"), _jpeg(b"IMG2")
+    r = client.post("/v1/videos", data={"prompt": "multi"},
+                    files=[("input_images", (None, d1)), ("input_images", (None, d2))])
+    assert r.status_code == 200, r.text
+    p = core.get_job(r.json()["id"])["params"]
+    assert len(p["refs"]) == 2, p["refs"]
+    assert Path(p["refs"][0]["path"]).read_bytes() == b"IMG1"
+    assert Path(p["refs"][1]["path"]).read_bytes() == b"IMG2"
+    assert p["reference_image_size"] == 1
+    # 单字段 JSON 数组字符串形式
+    r2 = client.post("/v1/videos",
+                     data={"prompt": "arr", "input_images": json.dumps([d1, d2])})
+    assert r2.status_code == 200, r2.text
+    assert len(core.get_job(r2.json()["id"])["params"]["refs"]) == 2
+
+
+def test_v1_videos_first_frame_and_mute(client):
+    """first_frame_image dataURL/本地路径 → params.first_frame（不入 refs）；mute_audio。"""
+    r = client.post("/v1/videos", json={
+        "prompt": "ff", "size": "864x480", "first_frame_image": _jpeg(b"FFDATA"),
+        "mute_audio": True, "input_images": [_jpeg(b"REFDATA")]})
+    assert r.status_code == 200, r.text
+    p = core.get_job(r.json()["id"])["params"]
+    assert os.path.isfile(p["first_frame"])
+    assert Path(p["first_frame"]).read_bytes() == b"FFDATA"
+    assert p["mute_audio"] is True
+    assert len(p["refs"]) == 1
+    assert Path(p["refs"][0]["path"]).read_bytes() == b"REFDATA"
+    # 本地绝对路径直接透传；默认 mute_audio=False
+    r2 = client.post("/v1/videos", json={
+        "prompt": "ff2", "first_frame_image": os.path.join(_TMP, "in.png")})
+    assert r2.status_code == 200, r2.text
+    p2 = core.get_job(r2.json()["id"])["params"]
+    assert p2["first_frame"] == os.path.join(_TMP, "in.png")
+    assert p2["mute_audio"] is False and p2["refs"] == []
+    # 不可达 URL → 400（fail loudly）
+    r3 = client.post("/v1/videos", json={
+        "prompt": "ff3", "first_frame_image": "http://127.0.0.1:9/x.png"})
+    assert r3.status_code == 400, r3.text
+
+
+def test_v1_videos_malicious_new_fields(client):
+    """新字段信任边界：空白跳过、bool 宽容解析、空条目跳过、坏值 400 不 500。"""
+    r = client.post("/v1/videos", json={
+        "prompt": "edge", "first_frame_image": "   ", "mute_audio": "TRUE",
+        "input_images": ["", "  ", None]})
+    assert r.status_code == 200, r.text
+    p = core.get_job(r.json()["id"])["params"]
+    assert p["first_frame"] is None and p["refs"] == []
+    assert p["mute_audio"] is True  # "TRUE"/"1"/"yes" 均视为真
+    # multipart：mute_audio="1" 宽容解析；空串 first_frame_image 跳过
+    r2 = client.post("/v1/videos", data={"prompt": "mb", "mute_audio": "1",
+                                         "first_frame_image": ""})
+    assert r2.status_code == 200, r2.text
+    p2 = core.get_job(r2.json()["id"])["params"]
+    assert p2["mute_audio"] is True and p2["first_frame"] is None
+    # 坏值：400 + 中文 detail，绝不 500
+    for payload in ({"prompt": "b1", "first_frame_image": 123},
+                    {"prompt": "b2", "input_images": "[not json"},
+                    {"prompt": "b3", "input_images": [_jpeg(b"x"), 7]}):
+        r3 = client.post("/v1/videos", json=payload)
+        assert r3.status_code == 400, (payload, r3.status_code, r3.text)
+
+
 def test_sora_status_mapping_and_content(client):
     r = client.post("/v1/videos", json={"prompt": "smoke", "size": "864x480"})
     jid = r.json()["id"]
@@ -167,6 +239,12 @@ def test_sora_status_mapping_and_content(client):
     s = client.get(f"/v1/videos/{jid}").json()
     assert s["status"] == "failed" and s["error"] == "bye"
     assert client.get("/v1/videos/video_nope").status_code == 404
+    # 影策把分镜图编码成 >1MB 的 input_images 文本字段：
+    # starlette 非文件 part 默认 1MB 上限曾 400 "Part exceeded maximum size"
+    big = "data:image/png;base64," + base64.b64encode(
+        b"\x89PNG\r\n\x1a\n" + os.urandom(1_200_000)).decode()
+    r = client.post("/v1/videos", json={"prompt": "big ref", "input_images": [big]})
+    assert r.status_code == 200, f"{r.status_code} {r.text[:120]}"
     # 影策 newapi 上游取消走 DELETE；重复取消/已结束也 200 + 当前状态
     r = client.post(f"/v1/videos/{jid}/cancel")
     assert r.status_code == 200 and r.json()["id"] == jid, r.text
