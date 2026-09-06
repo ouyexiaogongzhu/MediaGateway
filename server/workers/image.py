@@ -26,10 +26,8 @@ _VARIANT_DIRS = {
     "9b-base": "/Users/vincent/tool/iris.c/flux-klein-9b-base",
 }
 
-# ponytail: one global lock serializes iris subprocesses — parallel iris+iris is
-# unmeasured (docs only prove iris+cosyvoice coexists), so this is the safe fallback
-# even though the budget admits 2 (2×10.8GB < 40GB). Narrow to the model-load window
-# or drop it once parallel throughput is measured.
+# ponytail: 全局锁串行——实测 M5 Pro 上双 iris 进程 Metal 争抢,单张 71.7s →
+# 并行各 447-499s(6× 劣化),吞吐反降。若未来要并行,需同进程 batching 或 Metal 命令队列共享
 _run_lock = threading.Lock()
 
 
