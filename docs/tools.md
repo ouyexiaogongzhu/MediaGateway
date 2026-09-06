@@ -70,3 +70,12 @@ cd ~/tool/iris.c
 - 独立 `.venv`（py3.12 + torch MPS/MLX）；包装脚本 `mg_music.py`（DiT-only，thinking=False）
 - 实测：45s cinematic BGM 冷 128s / **暖 17s**，峰值 RSS **14.8GB**，输出 48kHz/16bit 立体声 WAV
 - Memory budget：`MEM_GB=15`（保守值）；LM/thinking 路径未启用（需要歌词扩展时再开）
+
+## Uncensored Text Encoder(2026-09-07 已装)
+
+- `flux-klein-9b/text_encoder/` 已替换为 [ponpoke/flux2-klein-9b-uncensored-text-encoder](https://huggingface.co/ponpoke/flux2-klein-9b-uncensored-text-encoder)
+  (ablated Qwen3-8B,BF16,含 index;原版备份在同目录 `text_encoder.orig/`)
+- **效果**:角色参考图的服装/发型锚定显著增强——无造型锁 prompt 也能跟随参考图
+  (实测:冰法师白蓝长裙不再漂成裤子);无害提示词余弦 0.97,一般能力无损
+- 原理:审查在文字编码器(概念 embedding 打折),DiT 无拒绝回路;ablation 移除拒绝方向
+- 回滚:`rm -rf text_encoder && mv text_encoder.orig text_encoder`
