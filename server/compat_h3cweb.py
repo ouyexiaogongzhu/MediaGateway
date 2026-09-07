@@ -258,6 +258,44 @@ def _input_image_values(entries) -> list:
             if v is not None and str(v).strip()]
 
 
+import shutil as _shutil
+import subprocess as _subprocess
+
+
+def _shrink_ref_for_h3(path: str, max_side: int = 1536) -> str:
+    """h3 的 Qwen3 prefill 序列含参考图 vision tokens（随分辨率暴涨）：
+    参考图长边 >1536px 会撑爆 threadgroup memory（实测 2848x1600 直接失败）。
+    超限图原地缩到长边 1536（短边按比例取 32 倍数），返回新路径；失败回退原图。"""
+    probe_bin = _shutil.which("ffprobe") or "ffprobe"
+    try:
+        proc = _subprocess.run(
+            [probe_bin, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
+            capture_output=True, timeout=30)
+    except (OSError, _subprocess.TimeoutExpired):
+        return path
+    try:
+        w_str, h_str = proc.stdout.decode().strip().split(",")[:2]
+        w, h = int(w_str), int(h_str)
+    except ValueError:
+        return path
+    if max(w, h) <= max_side:
+        return path
+    scale = max_side / max(w, h)
+    nw = max(32, int(w * scale) // 32 * 32)
+    nh = max(32, int(h * scale) // 32 * 32)
+    dst = f"{path}.s{nw}x{nh}.png"
+    ffmpeg_bin = _shutil.which("ffmpeg") or "ffmpeg"
+    try:
+        proc = _subprocess.run(
+            [ffmpeg_bin, "-v", "error", "-i", path, "-vf",
+             f"scale={nw}:{nh}", "-y", dst],
+            capture_output=True, timeout=120)
+    except (OSError, _subprocess.TimeoutExpired):
+        return path
+    return dst if os.path.isfile(dst) else path
+
+
 @router.post("/v1/videos")
 async def openai_create_video(request: Request):
     """Accept JSON (Sora API style) and multipart (canvas OpenAI preset)."""
@@ -288,6 +326,9 @@ async def openai_create_video(request: Request):
         if ffi is not None and str(ffi).strip():
             first_frame = _localize_image(ffi)
         mute_audio = _as_bool(form.get("mute_audio"))
+        ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
+        if first_frame:
+            first_frame = _shrink_ref_for_h3(first_frame)
     else:
         try:
             raw = await request.json()
@@ -316,6 +357,9 @@ async def openai_create_video(request: Request):
         if ffi is not None and str(ffi).strip():
             first_frame = _localize_image(ffi)
         mute_audio = _as_bool(raw.get("mute_audio"))
+        ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
+        if first_frame:
+            first_frame = _shrink_ref_for_h3(first_frame)
     prompt = re.sub(r"\s*\[IMAGE_\d+\]", "", str(raw.get("prompt") or "")).strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")
