@@ -29,10 +29,15 @@ open(sys.argv[-1], "w").close()  # touch output (last argv)
 """
 
 FAKE_FFPROBE = r"""#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 args = sys.argv[1:]
 if "-select_streams" in args:
-    print("" if os.environ.get("FAKE_NO_AUDIO") else "0")
+    if "stream=index" in args:  # 音轨探测 (mux/xfade/bgm)
+        print("" if os.environ.get("FAKE_NO_AUDIO") else "0")
+    else:  # concat -c copy 守卫的视频流探测，按输入路径查表
+        table = json.loads(os.environ.get("FAKE_VSTREAMS") or "{}")
+        key = next((a for a in args if a.endswith(".mp4")), "")
+        print(json.dumps(table.get(key, "")))
 else:
     print(os.environ.get("FAKE_DURATION", "5.000000"))
 """
@@ -102,6 +107,25 @@ def test_concat_copy_equivalent_and_executes():
         assert argv[:4] == cmd[1:5]
         assert argv[5] == "-i" and argv[7:9] == ["-c", "copy"]
         assert argv[9] == str(out)  # 输出路径为真实执行目标
+
+
+def test_concat_copy_rejects_mixed_streams():
+    """-c copy 守卫：探测到编码/分辨率不一致 → 中文报错并提示 transition；
+    探测不到（非媒体文件）不拦截，维持旧行为交给 ffmpeg。"""
+    a = {"streams": [{"codec_name": "h264", "width": 864, "height": 480}]}
+    b = {"streams": [{"codec_name": "h264", "width": 512, "height": 288}]}
+    with env(FFMPEG_BIN=str(FFMPEG)):  # 探测失败 → 不拦截
+        render.concat([p("a.mp4"), p("b.mp4")], p("out.mp4"))
+    with env(FFMPEG_BIN=str(FFMPEG),
+             FAKE_VSTREAMS=json.dumps({p("a.mp4"): a, p("b.mp4"): a})):
+        render.concat([p("a.mp4"), p("b.mp4")], p("out.mp4"))  # 一致 → 放行
+    with env(FFMPEG_BIN=str(FFMPEG),
+             FAKE_VSTREAMS=json.dumps({p("a.mp4"): a, p("b.mp4"): b})):
+        try:
+            render.concat([p("a.mp4"), p("b.mp4")], p("out.mp4"))
+            assert False, "must reject mismatched streams"
+        except render.RenderError as e:
+            assert "不一致" in str(e) and "transition" in str(e)
 
 
 def test_concat_needs_two_inputs():

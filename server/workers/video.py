@@ -14,6 +14,8 @@ from pathlib import Path
 
 from vendor.h3_bridge import H3Engine
 
+from .. import render
+
 TYPE = "video"
 MEM_GB = 35.0
 
@@ -182,6 +184,10 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
                     engine.close()  # 不吞 generate 的原始异常
     if cancel():
         raise VideoError("cancelled")
+    if params.get("mute_audio"):
+        muted = str(job_dir / "_muted.mp4")
+        render.strip_audio(output_path, muted)  # -c:v copy -an, 秒级
+        os.replace(muted, output_path)  # 产物路径不变
     return {"output_path": output_path,
             **{k: meta[k] for k in ("width", "height", "frames", "fps", "seed")
                if k in meta}}

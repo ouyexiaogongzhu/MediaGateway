@@ -11,6 +11,7 @@ Env:
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -89,6 +90,19 @@ def _probe(path: str, select_audio: bool) -> str:
 # 無 transition: concat demuxer + -c copy（無損，不重編碼）
 # 有 transition: xfade + acrossfade 逐段串接（重編碼，要求音軌/解析度一致）
 
+def _probe_video_stream(path: str) -> Tuple[str, str, str]:
+    """(codec, width, height)；探测失败返回 ("", "", "") — 拦截交给 ffmpeg 裁决。"""
+    cmd = [_bin("ffprobe", "FFPROBE_BIN"), "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=codec_name,width,height", "-of", "json", path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+        s = json.loads(proc.stdout.decode("utf-8", "replace"))["streams"][0]
+        return (str(s.get("codec_name") or ""), str(s.get("width") or ""),
+                str(s.get("height") or ""))
+    except Exception:  # noqa: BLE001
+        return ("", "", "")
+
+
 def concat(
     inputs: List[str],
     output: str,
@@ -103,6 +117,14 @@ def concat(
         raise RenderError("需要至少 2 个鏡頭")
 
     if not transition:
+        # -c copy 前提：各输入视频流参数（编码/分辨率）一致，否则产出花屏坏文件。
+        # 只在明确探测出不一致时拦截；探测失败不拦路，让 ffmpeg 最终裁决。
+        streams = {_probe_video_stream(f) for f in inputs}
+        streams.discard(("", "", ""))
+        if len(streams) > 1:
+            raise RenderError(
+                f"镜头视频流参数不一致 {sorted(streams)}，concat -c copy 会产出坏文件；"
+                "请统一素材（同编码同分辨率）或指定 transition（xfade 会重编码）")
         # concat demuxer：临时 list 文件，格式 file '<path>'
         fd, list_path = tempfile.mkstemp(suffix=".txt", prefix="concat_")
         with os.fdopen(fd, "w") as fh:
@@ -305,6 +327,16 @@ def freeze(
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", output]
     if not dry_run:
         _run(cmd, timeout)
+    return cmd
+
+
+def strip_audio(video: str, output: str, timeout: float = DEFAULT_TIMEOUT) -> List[str]:
+    """-c:v copy -an 去音轨（video worker mute_audio）。流复制，秒级完成。"""
+    _check_file(video)
+    cmd = [_bin("ffmpeg", "FFMPEG_BIN"), "-y", "-v", "error", "-i", video,
+           "-c:v", "copy", "-an", output]
+    _run(cmd, timeout)
+    _check_file(output)
     return cmd
 
 

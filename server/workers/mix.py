@@ -1,7 +1,11 @@
-"""Mix worker: ffmpeg — sfx/music tracks onto a video (-c:v copy, aac audio).
+"""Mix worker: ffmpeg — audio tracks onto a video.
 
-tracks: [{"sfx_tag": "wind" | "path": "/abs/file.mp3", "gain_db": 0.0, "start_s": 0.0}]
-sfx_tag picks a random file from MG_ASSETS/sfx/<tag>/. Empty tracks strips audio.
+Two param shapes:
+- audio_tracks (render.mux, re-encode): {video, audio_tracks: [{path, start?, loop?}],
+  output_name?="final.mp4", subtitles?, dialogue_volume?, music_volume?}
+- tracks (legacy, -c:v copy): [{"sfx_tag": "wind" | "path": "/abs/file.mp3",
+  "gain_db": 0.0, "start_s": 0.0}] — sfx_tag picks a random file from
+  MG_ASSETS/sfx/<tag>/. Empty tracks strips audio.
 """
 from __future__ import annotations
 
@@ -12,10 +16,10 @@ import subprocess
 import threading
 from pathlib import Path
 
-from .. import core
+from .. import core, render
 
 TYPE = "mix"
-MEM_GB = 0.5
+MEM_GB = 1
 
 DEFAULT_TIMEOUT = 600.0
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"  # launchd PATH misses homebrew
@@ -66,7 +70,38 @@ def _build_cmd(video_path: str, tracks: list[dict], out: Path,
     return cmd + [str(out)]
 
 
+def _run_mux(params: dict, job_dir: Path, progress, cancel) -> dict:
+    """audio_tracks shape → render.mux（重编码 aac，支持垫底循环/字幕/分轨音量）。
+
+    loop 条目的 start 被忽略（垫底恒从 0 循环铺满视频时长）。"""
+    video_path = params.get("video") or params.get("video_path")
+    if not video_path or not Path(video_path).is_file():
+        raise ValueError(f"video not found: {video_path}")
+    tracks = params.get("audio_tracks") or []
+    if not isinstance(tracks, list) or not all(
+            isinstance(t, dict) and isinstance(t.get("path"), str) and t["path"]
+            for t in tracks):
+        raise ValueError(
+            "audio_tracks 必须是 [{path, start?, loop?}] 列表（path 必填非空）")
+    output = str(job_dir / params.get("output_name", "final.mp4"))
+    if cancel():
+        raise Exception("cancelled")
+    progress(0.1, "muxing")
+    with _run_lock:  # 与 legacy 路径一致：全局串行 ffmpeg 子进程
+        render.mux(video_path, tracks, output,
+                   subtitles=params.get("subtitles"),
+                   dialogue_volume=float(params.get("dialogue_volume", 1.0)),
+                   music_volume=float(params.get("music_volume", 0.15)))
+    progress(1.0, "done")
+    return {"output_path": output, "tracks": len(tracks)}
+
+
 def run(params: dict, job_dir: Path, progress, cancel) -> dict:
+    if "audio_tracks" in params or params.get("subtitles"):
+        if params.get("tracks"):
+            raise ValueError(
+                "tracks 与 audio_tracks/subtitles 混用：请只传一种契约")
+        return _run_mux(params, job_dir, progress, cancel)
     video_path = params.get("video_path")
     if not video_path or not Path(video_path).is_file():
         raise ValueError(f"video_path not found: {video_path}")
