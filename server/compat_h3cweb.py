@@ -436,6 +436,36 @@ def openai_video_status(job_id: str, request: Request):
     return out
 
 
+@router.post("/v1/upscale")
+async def create_upscale(request: Request):
+    """SeedVR2 视频二次采样：multipart video+resolution（或 JSON video_path）→ 异步 job。"""
+    ct = request.headers.get("content-type", "")
+    video_path: Optional[str] = None
+    resolution = "1080"
+    model = "3b"
+    if ct.startswith("multipart/") or ct.startswith("application/x-www-form"):
+        form = await request.form(max_part_size=2 << 30)
+        resolution = str(form.get("resolution") or resolution)
+        model = str(form.get("model") or model)
+        up = form.get("video")
+        if up is not None and hasattr(up, "read"):
+            ext = os.path.splitext(getattr(up, "filename", "") or "")[1] or ".mp4"
+            os.makedirs(REFS_DIR, exist_ok=True)
+            video_path = os.path.join(REFS_DIR, f"ups_{uuid.uuid4().hex[:8]}{ext}")
+            with open(video_path, "wb") as f:
+                f.write(await up.read())
+    else:
+        raw = await request.json()
+        video_path = raw.get("video_path")
+        resolution = str(raw.get("resolution") or resolution)
+        model = str(raw.get("model") or model)
+    if not video_path or not os.path.isfile(video_path):
+        raise HTTPException(400, "video file missing")
+    resp = core.create_job("seedvr2", {"video_path": video_path,
+                                       "resolution": resolution, "model": model})
+    return {"id": resp["id"], "job_id": resp["id"], "status": resp["status"]}
+
+
 @router.post("/v1/videos/{job_id}/cancel")
 def openai_video_cancel(job_id: str):
     """影策 newapi 适配器的上游取消（BuildCancel）。任务已结束也返回 200 + 当前状态。"""
