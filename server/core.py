@@ -238,7 +238,13 @@ def _admit_next() -> tuple[str, dict] | None:
                     break
             if blocked:
                 break
-        if running_gb + worker.MEM_GB <= BUDGET_GB:
+        # 引擎已驻留的同类型 job 复用常驻实例（keep_loaded 批量模式），内存增量为零；
+        # 否则驻留 35GB 会被重复计费，FIFO 头部死锁（后继 job 永远进不来）。
+        # video 引擎驻留的判定与 _resident_gb 同源：_engine 属性。
+        inc = worker.MEM_GB
+        if row["type"] == "video" and getattr(worker, "_engine", None) is not None:
+            inc = 0
+        if running_gb + inc <= BUDGET_GB:
             return worker, _job_row(row)
         # budget-blocked: stop at first job that doesn't fit (FIFO head blocking
         # keeps priority honest; jobs behind it may fit but wait their turn)
