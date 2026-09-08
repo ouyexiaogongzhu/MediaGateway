@@ -498,6 +498,7 @@ class MixIn(BaseModel):
     video_path: Optional[str] = None
     video_job_id: Optional[str] = None
     tracks: list[dict] = []
+    keep_source_audio: bool = False  # 视频自带音轨（h3 原生对白）参与混音
 
 
 @router.post("/v1/mix")
@@ -511,7 +512,8 @@ def create_mix(req: MixIn):
         video = job["output_path"]
     if not video:
         raise HTTPException(400, "video_path or video_job_id required")
-    resp = core.create_job("mix", {"video_path": video, "tracks": req.tracks})
+    resp = core.create_job("mix", {"video_path": video, "tracks": req.tracks,
+                                   "keep_source_audio": req.keep_source_audio})
     return {"id": resp["id"], "job_id": resp["id"], "status": resp["status"]}
 
 

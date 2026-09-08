@@ -48,20 +48,31 @@ def _video_duration(path: str) -> float:
 
 
 def _build_cmd(video_path: str, tracks: list[dict], out: Path,
-               duration: float | None = None) -> list[str]:
+               duration: float | None = None,
+               keep_source_audio: bool = False) -> list[str]:
     cmd = [FFMPEG, "-y", "-v", "error", "-i", video_path]
     for t in tracks:
         cmd += ["-i", t["path"]]
     fc = "".join(
-        f"[{i + 1}:a]adelay={int(float(t.get('start_s', 0.0) or 0.0) * 1000)}:all=1,"
+        f"[{i + 1}:a]adelay={int(float(t.get('start_s', 0.0) or 0.0) * 1000):d}:all=1,"
         f"volume={float(t.get('gain_db', 0.0))}dB[a{i}];"
         for i, t in enumerate(tracks))
-    if fc:
+    # keep_source_audio: 视频自带音轨（如 h3 原生对白）作为第一路参与混音
+    src_label = "[0:a]" if keep_source_audio else ""
+    mix_inputs = len(tracks) + (1 if keep_source_audio else 0)
+    if mix_inputs > 1:
         cmd += ["-filter_complex",
-                fc + "".join(f"[a{i}]" for i in range(len(tracks)))
-                + f"amix=inputs={len(tracks)}:normalize=0[aout]",
+                fc + src_label + "".join(f"[a{i}]" for i in range(len(tracks)))
+                + f"amix=inputs={mix_inputs}:normalize=0[aout]",
                 "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac"]
-    else:  # no tracks: strip audio
+    elif mix_inputs == 1:
+        # 仅源音轨或仅一条轨：直映射，不过 amix
+        if keep_source_audio:
+            cmd += ["-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac"]
+        else:
+            cmd += ["-filter_complex", fc.rstrip(";") + "[aout]",
+                    "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac"]
+    else:  # no tracks, no source: strip audio
         cmd += ["-an", "-c:v", "copy"]
     if duration:
         # amix runs to the longest track; long ambience sfx would stretch the
@@ -133,7 +144,8 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     with _run_lock:
         try:
             proc = subprocess.run(
-                _build_cmd(video_path, resolved, out, duration), capture_output=True, text=True,
+                _build_cmd(video_path, resolved, out, duration,
+                           bool(params.get('keep_source_audio'))), capture_output=True, text=True,
                 timeout=float(params.get("timeout", DEFAULT_TIMEOUT)))
         except subprocess.TimeoutExpired:
             raise Exception(f"mix timeout after {params.get('timeout', DEFAULT_TIMEOUT)}s")
