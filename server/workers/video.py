@@ -113,13 +113,15 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     overrides = dict(
         width=width,
         height=height,
-        steps=int(params.get("steps", profile.get("steps", 6))),
-        denoise_reuse=int(params.get("denoise_reuse", profile.get("denoise_reuse", 1))),
+        # 默认走 WorkBuddy 62 链交付实证档（2026-09-07，768x1344 ≈2.5 分/镜）：
+        # steps 4 = klein 蒸馏原生；reuse2/core4 = 官方默认档，比 h3cweb 沿用的 1/1 快 ~4-5x
+        steps=int(params.get("steps", profile.get("steps", 4))),
+        denoise_reuse=int(params.get("denoise_reuse", profile.get("denoise_reuse", 2))),
         dit_layers=int(params.get("dit_layers", profile.get("dit_layers", 45))),
     )
     # core_reuse/token_reduction/ssd_streaming mirror h3cweb: only send non-defaults.
     # 哨兵合并：显式键（含显式 false/0）优先于 profile
-    core = int(params["core_reuse"]) if "core_reuse" in params else int(profile.get("core_reuse", 1))
+    core = int(params["core_reuse"]) if "core_reuse" in params else int(profile.get("core_reuse", 4))
     if core > 1:
         overrides["core_reuse"] = core
     tok = params["token_reduction"] if "token_reduction" in params else profile.get("token_reduction")

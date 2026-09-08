@@ -108,8 +108,8 @@ def test_defaults_and_param_mapping():
     eng = FakeEngine()
     _, calls = run_with({"prompt": "a cat"}, eng)
     ov = calls[0]["overrides"]
-    assert ov == {"width": 864, "height": 480, "steps": 6, "denoise_reuse": 1,
-                  "dit_layers": 45}, ov
+    assert ov == {"width": 864, "height": 480, "steps": 4, "denoise_reuse": 2,
+                  "dit_layers": 45, "core_reuse": 4}, ov
     assert calls[0]["refs"] == []
     assert calls[0]["output_path"].endswith("output.mp4")
 
