@@ -65,6 +65,7 @@ class JobRequest(BaseModel):
     ssd_streaming: bool = False
     reference_image_size: Optional[int] = None
     first_frame: Optional[str] = None
+    keep_loaded: bool = False
     mute_audio: bool = False
 
 
@@ -302,6 +303,7 @@ async def openai_create_video(request: Request):
     ct = request.headers.get("content-type", "")
     ref_paths: list[str] = []
     first_frame: Optional[str] = None
+    keep_loaded: bool = False
     mute_audio = False
     if ct.startswith("multipart/") or ct.startswith("application/x-www-form"):
         # 影策把分镜图整张编码成 input_images 文本字段（>1MB）：
@@ -326,6 +328,7 @@ async def openai_create_video(request: Request):
         if ffi is not None and str(ffi).strip():
             first_frame = _localize_image(ffi)
         mute_audio = _as_bool(form.get("mute_audio"))
+        keep_loaded = _as_bool(form.get("keep_loaded"))
         ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
         if first_frame:
             first_frame = _shrink_ref_for_h3(first_frame)
@@ -357,6 +360,7 @@ async def openai_create_video(request: Request):
         if ffi is not None and str(ffi).strip():
             first_frame = _localize_image(ffi)
         mute_audio = _as_bool(raw.get("mute_audio"))
+        keep_loaded = _as_bool(raw.get("keep_loaded"))
         ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
         if first_frame:
             first_frame = _shrink_ref_for_h3(first_frame)
@@ -405,6 +409,13 @@ async def openai_create_video(request: Request):
         height -= height % 32
     if width < 32 or height < 32:
         raise HTTPException(400, "resolution too small")
+    # LTX-2.5 引擎路由（model 含 ltx）：MLX 22B，原生 AV 生成，無 h3 像素上限
+    model_key = str(raw.get("model") or (form.get("model") if ct.startswith("multipart/") else "") or "")
+    if "ltx" in model_key.lower():
+        image_path = ref_paths[0] if ref_paths else first_frame
+        resp = core.create_job("ltx", {"prompt": prompt, "width": width, "height": height,
+                                       "seconds": seconds, "image_path": image_path})
+        return {"id": resp["id"], "task_id": resp["id"], "status": resp["status"]}
     if width * height > 768 * 1344:
         raise HTTPException(400, "resolution exceeds h3 768*1344 pixel limit")
     resp = create_job(JobRequest(
@@ -414,7 +425,7 @@ async def openai_create_video(request: Request):
         # keep reference conditioning at native res (up to 2048px), not
         # stretched down to the render canvas
         reference_image_size=1 if ref_paths else 0,
-        first_frame=first_frame, mute_audio=mute_audio))
+        first_frame=first_frame, mute_audio=mute_audio, keep_loaded=keep_loaded))
     return {"id": resp["job_id"], "task_id": resp["job_id"], "status": "queued"}
 
 
