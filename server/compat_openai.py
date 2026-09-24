@@ -92,6 +92,24 @@ async def images_generations(req: ImageGenIn):
     extra = {"width": width, "height": height}
     if req.variant:
         extra["variant"] = req.variant
+    # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：本地 daemon :8187，無 h3/iris 依賴
+    if req.model and any(k in req.model.lower() for k in ("sdxl", "realvis", "noobai")):
+        import urllib.request
+        daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
+        body = {"model": "realvis" if "realvis" in req.model.lower() else
+                ("noobai" if "noobai" in req.model.lower() else "sdxl"),
+                "prompt": req.prompt, "width": width, "height": height,
+                "steps": 30, "guidance_scale": 5.0}
+        if req.seed is not None:
+            body["seed"] = req.seed
+        r = urllib.request.Request(daemon + "/generate", data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=600) as resp:
+            d = json.loads(resp.read())
+        with open(d["path"], "rb") as f:
+            img = base64.b64encode(f.read()).decode()
+        return {"created": int(time.time()),
+                "data": [{"b64_json": img}] * 1}
     return {"created": int(time.time()),
             "data": await _gen_images(req.prompt, n, req.seed, extra)}
 
@@ -129,6 +147,8 @@ async def images_edits(
     n: int = Form(1),
     seed: Optional[int] = Form(None),
     variant: Optional[str] = Form(None),  # 9b | 9b-base
+    model: Optional[str] = Form(None),  # sdxl-realvis | sdxl-noobai → SDXL daemon
+    strength: Optional[float] = Form(None),  # img2img 强度（仅 sdxl 路由）
     image: list[UploadFile] = File([]),
     mask: Optional[UploadFile] = File(None),
 ):
@@ -147,6 +167,29 @@ async def images_edits(
         raise HTTPException(400, "mask is not supported by the local image model")
     n = max(1, min(int(n or 1), 4))
     width, height = _parse_size(size)
+    # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重繪，無 h3/iris 依賴
+    if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
+        import urllib.request
+        daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
+        tmpdir = tempfile.mkdtemp(prefix="mg_edits_sdxl_")
+        try:
+            refs = [_save_ref(i, await up.read(), tmpdir) for i, up in enumerate(image)]
+            body = {"model": "realvis" if "realvis" in model.lower() else
+                    ("noobai" if "noobai" in model.lower() else "sdxl"),
+                    "prompt": prompt, "width": width, "height": height,
+                    "seed": seed if seed is not None else 0,
+                    "init_image_path": refs[0],
+                    "strength": strength if strength is not None else 0.45}
+            r = urllib.request.Request(daemon + "/generate", data=json.dumps(body).encode(),
+                                       headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(r, timeout=900) as resp:
+                d = json.loads(resp.read())
+            with open(d["path"], "rb") as f:
+                img = base64.b64encode(f.read()).decode()
+            return {"created": int(time.time()), "data": [{"b64_json": img}]}
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    n = max(1, min(int(n or 1), 4))
     tmpdir = tempfile.mkdtemp(prefix="mg_edits_")
     try:
         refs = [_save_ref(i, await up.read(), tmpdir) for i, up in enumerate(image)]
