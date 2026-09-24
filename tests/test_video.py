@@ -140,7 +140,7 @@ def test_optional_flags_passthrough():
     assert ov["ssd_streaming"] == 1 and ov["seed"] == 123
     assert ov["reference_image_size"] == 512
     _, calls = run_with({"prompt": "x"}, FakeEngine())
-    assert "core_reuse" not in calls[0]["overrides"]
+    assert calls[0]["overrides"]["core_reuse"] == 4  # 默认档显式下发
     assert "seed" not in calls[0]["overrides"]
     assert "token_reduction" not in calls[0]["overrides"]
 

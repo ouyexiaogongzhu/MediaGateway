@@ -416,6 +416,16 @@ async def openai_create_video(request: Request):
         resp = core.create_job("ltx", {"prompt": prompt, "width": width, "height": height,
                                        "seconds": seconds, "image_path": image_path})
         return {"id": resp["id"], "task_id": resp["id"], "status": resp["status"]}
+    # SDXL 圖片路由（model 含 sdxl/realvis/noobai）：本地 daemon，豎版 832x1216 默認，無 h3 像素上限
+    if any(k in model_key.lower() for k in ("sdxl", "realvis", "noobai")):
+        sp = {"prompt": prompt,
+              # 豎版默認，不走上面視頻 864x480 默認
+              "width": width if size else 832, "height": height if size else 1216}
+        for key in ("negative_prompt", "model", "steps", "guidance_scale", "seed"):
+            if raw.get(key) is not None:
+                sp[key] = raw[key]
+        resp = core.create_job("sdxl", sp)
+        return {"id": resp["id"], "task_id": resp["id"], "status": resp["status"]}
     if width * height > 768 * 1344:
         raise HTTPException(400, "resolution exceeds h3 768*1344 pixel limit")
     resp = create_job(JobRequest(

@@ -7,6 +7,7 @@ audio clarity decisively better). TTS 暫停路線下，對白由 prompt 攜帶�
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -30,6 +31,8 @@ def _cli_cmd(prompt: str, image_path: str | None, out: str,
            "-o", out]
     if image_path:
         cmd += ["--image", image_path]
+    if params.get("low_ram"):
+        cmd += ["--low-ram"]
     return cmd
 
 
@@ -47,17 +50,31 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     if cancel():
         raise Exception("cancelled")
     progress(0.05, "generating")
+    # ponytail: 不用 subprocess.run(capture_output) —— CLI 崩溃/被杀时孤儿孙进程
+    # 会握住管道 EOF，run() 永远阻塞（job 卡 running 实证两次）。改日志文件+wait。
+    log = out.parent / "ltx_render.log"
     with _run_lock:
+        proc = subprocess.Popen(
+            _cli_cmd(prompt, image, str(out), width, height),
+            cwd=DEFAULT_HOME, stdout=open(log, "w"), stderr=subprocess.STDOUT,
+            start_new_session=True)
         try:
-            proc = subprocess.run(
-                _cli_cmd(prompt, image, str(out), width, height),
-                cwd=DEFAULT_HOME, capture_output=True, text=True,
-                timeout=float(params.get("timeout", DEFAULT_TIMEOUT)))
+            proc.wait(timeout=float(params.get("timeout", DEFAULT_TIMEOUT)))
         except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
             raise Exception(f"ltx timeout after {params.get('timeout', DEFAULT_TIMEOUT)}s")
+        if cancel():
+            os.killpg(proc.pid, signal.SIGKILL)
+            raise Exception("cancelled")
     progress(0.95, "saving")
     if proc.returncode != 0:
-        raise Exception(f"ltx exited {proc.returncode}: {(proc.stderr or proc.stdout or '')[-500:]}")
+        tail = ""
+        try:
+            tail = open(log, errors="ignore").read()[-500:]
+        except OSError:
+            pass
+        raise Exception(f"ltx exited {proc.returncode}: {tail}")
     if not out.is_file():
         raise Exception("ltx produced no output")
     return {"output_path": str(out), "width": width, "height": height}
