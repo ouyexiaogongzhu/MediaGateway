@@ -92,6 +92,30 @@ async def images_generations(req: ImageGenIn):
     extra = {"width": width, "height": height}
     if req.variant:
         extra["variant"] = req.variant
+    # 豆包（doubao2api :8401）：免費生圖，size 直接透傳（daemon 自帶 ratio 換算）
+    if req.model and req.model.lower().startswith("doubao"):
+        base = os.environ.get("DOUBAO2API_URL", "http://127.0.0.1:8401")
+        body = {"prompt": req.prompt, "size": req.size or "1024x1024"}
+        if req.seed is not None:
+            body["seed"] = req.seed
+        r = urllib.request.Request(base + "/v1/images/generations",
+                                   data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=600) as resp:
+            d = json.loads(resp.read())
+        return {"created": int(time.time()), "data": d.get("data", [])}
+    # grok2api（:8402）：OpenAI 兼容直傳（Bearer = 網關客戶端密鑰）
+    if req.model and req.model.lower().startswith("grok"):
+        base = os.environ.get("GROK2API_URL", "http://127.0.0.1:8402")
+        key = os.environ.get("GROK_API_KEY", "")
+        body = {"model": "grok-imagine-image", "prompt": req.prompt, "n": 1}
+        r = urllib.request.Request(base + "/v1/images/generations",
+                                   data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json",
+                                            **({"Authorization": f"Bearer {key}"} if key else {})})
+        with urllib.request.urlopen(r, timeout=600) as resp:
+            d = json.loads(resp.read())
+        return {"created": int(time.time()), "data": d.get("data", [])}
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：本地 daemon :8187，無 h3/iris 依賴
     if req.model and any(k in req.model.lower() for k in ("sdxl", "realvis", "noobai")):
         import urllib.request

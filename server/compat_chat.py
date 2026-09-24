@@ -6,6 +6,8 @@ running on the GPU the LLM is not admitted: 503 with a retryable message
 """
 from __future__ import annotations
 
+import os
+
 import httpx
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -17,6 +19,22 @@ from . import core, llm
 router = APIRouter()
 
 UPSTREAM_TIMEOUT_S = 900.0  # cold load of the 19GB qwen takes minutes; don't 502 mid-load
+
+# 云端供应商路由（model 前缀 → 本地 api2 守护进程）。未命中 → 本地 qwen MLX。
+_PROVIDERS = [
+    ("doubao", "http://127.0.0.1:8401", os.environ.get("DOUBAO_API_KEY", "")),
+    ("gpt-5", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
+    ("chatgpt", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
+    ("grok", "http://127.0.0.1:8402", os.environ.get("GROK_API_KEY", "")),
+]
+
+
+def _route(model):
+    m = (model or "").lower()
+    for prefix, base, key in _PROVIDERS:
+        if m.startswith(prefix):
+            return base, key
+    return None, None
 
 
 class ChatMessage(BaseModel):
@@ -31,6 +49,11 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     enable_thinking: Optional[bool] = None
+
+
+def _upstream_error(message: str, status: int = 502) -> JSONResponse:
+    return JSONResponse(status_code=status, content={
+        "error": {"message": message, "type": "upstream_error"}})
 
 
 def _video_running() -> bool:
@@ -51,32 +74,36 @@ def chat_completions(req: ChatRequest):
     if req.stream:
         return JSONResponse(status_code=400, content={
             "error": {"message": "stream=true 不支持，请用非流式请求", "type": "invalid_request_error"}})
-    if _video_running():
-        return _busy_response()
-    try:
-        llm.ensure()
-    except RuntimeError as e:
-        return JSONResponse(status_code=502, content={
-            "error": {"message": f"LLM 不可用：{e}", "type": "upstream_error"}})
-    # re-check after the (possibly 10s+) spawn: a video job may have been
-    # admitted meanwhile — loading 19GB + 35GB together would OOM
-    if _video_running():
-        return _busy_response()
     body = req.model_dump(exclude_none=True)
-    # qwen3.8 reasoning burns ~12k tokens (~11 min @ 18tok/s) per round; the
-    # storyboard pipeline wants content, not deliberation. Caller can override.
-    body.setdefault("enable_thinking", False)
-    with llm.busy_guard():
+    base, key = _route(req.model)
+    if base is None:
+        # 本地 qwen MLX：按需拉起 + 内存互斥（19GB LLM 与 35GB 视频引擎互斥）
+        if _video_running():
+            return _busy_response()
         try:
-            r = httpx.post(f"{llm.BASE_URL}/v1/chat/completions", json=body,
-                           timeout=UPSTREAM_TIMEOUT_S)
+            llm.ensure()
+        except RuntimeError as e:
+            return _upstream_error(f"LLM 不可用：{e}")
+        # re-check after the (possibly 10s+) spawn: a video job may have been
+        # admitted meanwhile — loading 19GB + 35GB together would OOM
+        if _video_running():
+            return _busy_response()
+        body.setdefault("enable_thinking", False)
+        with llm.busy_guard():
+            try:
+                r = httpx.post(f"{llm.BASE_URL}/v1/chat/completions", json=body,
+                               timeout=UPSTREAM_TIMEOUT_S)
+            except httpx.HTTPError as e:
+                return _upstream_error(f"LLM upstream unreachable: {e}")
+    else:
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        try:
+            r = httpx.post(f"{base}/v1/chat/completions", json=body,
+                           timeout=UPSTREAM_TIMEOUT_S, headers=headers)
         except httpx.HTTPError as e:
-            return JSONResponse(status_code=502, content={
-                "error": {"message": f"LLM upstream unreachable: {e}", "type": "upstream_error"}})
+            return _upstream_error(f"供应商不可达：{e}")
     try:
         payload = r.json()
     except ValueError:
-        return JSONResponse(status_code=502, content={
-            "error": {"message": f"LLM upstream returned non-JSON ({r.status_code})",
-                      "type": "upstream_error"}})
+        return _upstream_error(f"上游返回非 JSON ({r.status_code})")
     return JSONResponse(status_code=r.status_code, content=payload)
