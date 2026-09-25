@@ -18,11 +18,12 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import core
@@ -157,6 +158,17 @@ async def images_generations(req: ImageGenIn):
 _MAGIC_EXTS = ((b"\x89PNG", "png"), (b"\xff\xd8", "jpg"), (b"P5", "ppm"), (b"P6", "ppm"))
 
 
+def _doubao_upload(daemon: str, data: bytes, filename: str) -> str:
+    """上传参考图到 doubao2api，返回 uri（TOS 地址）。"""
+    b = uuid.uuid4().hex
+    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(daemon + "/v1/images/upload", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read())["uri"]
+
+
 def _save_ref(idx: int, data: bytes, tmpdir: str) -> str:
     """iris 只读 8-bit 非隔行 PNG/JPEG/PPM；其余（webp/heic/16bit/隔行...）转成 PNG。"""
     for magic, ext in _MAGIC_EXTS:
@@ -207,6 +219,40 @@ async def images_edits(
         raise HTTPException(400, "mask is not supported by the local image model")
     n = max(1, min(int(n or 1), 4))
     width, height = _parse_size(size)
+    # 豆包分支（影策参考素材链路）：参考图上传 → ref_image_key 图生图
+    if model and model.lower().startswith("doubao"):
+        daemon = os.environ.get("DOUBAO2API_URL", "http://127.0.0.1:8401")
+        ref_uri = None
+        for up in image:  # 豆包单参考图；多图时取第一张
+            ref_uri = _doubao_upload(daemon, await up.read(), up.filename or "ref.png")
+            break
+        if ref_uri is None:
+            raise HTTPException(400, "at least one input image is required")
+        body = {"model": "doubao-image", "prompt": prompt,
+                "size": size or "1024x1024", "ref_image_key": ref_uri}
+        if seed is not None:
+            body["seed"] = seed
+        r = urllib.request.Request(daemon + "/v1/images/generations",
+                                   data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(r, timeout=900) as resp:
+                d = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return JSONResponse(status_code=e.code, content={
+                "error": {"message": f"doubao2api: {e.read()[:200].decode('utf-8', 'replace')}",
+                          "type": "upstream_error"}})
+        except urllib.error.URLError as e:
+            return JSONResponse(status_code=502, content={
+                "error": {"message": f"doubao2api 不可达：{e}", "type": "upstream_error"}})
+        out = []
+        for it in d.get("data", []):
+            img_b64 = it.get("b64_json")
+            if not img_b64 and it.get("url"):
+                with urllib.request.urlopen(it["url"], timeout=120) as ir:
+                    img_b64 = base64.b64encode(ir.read()).decode()
+            out.append({"b64_json": img_b64})
+        return {"created": int(time.time()), "data": out}
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重繪，無 h3/iris 依賴
     if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
         daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
