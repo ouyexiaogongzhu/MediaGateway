@@ -193,43 +193,68 @@ def _save_ref(idx: int, data: bytes, tmpdir: str) -> str:
 
 
 @router.post("/v1/images/edits")
-async def images_edits(
-    prompt: str = Form(...),
-    size: Optional[str] = Form(None),
-    n: int = Form(1),
-    seed: Optional[int] = Form(None),
-    variant: Optional[str] = Form(None),  # 9b | 9b-base
-    model: Optional[str] = Form(None),  # sdxl-realvis | sdxl-noobai → SDXL daemon
-    strength: Optional[float] = Form(None),  # img2img 强度（仅 sdxl 路由）
-    image: list[UploadFile] = File([]),
-    mask: Optional[UploadFile] = File(None),
-):
-    """影策带参考图生图（openai-images 协议的 edit_source 路径）。
-
-    iris 以 in-context conditioning 叠加参考图（-i 可重复，至多 16 张）；mask 不支持。
+async def images_edits(request: Request):
+    """影策带参考图生图，双协议端点：
+    - multipart（服务端 openai-image 路径）：Form + UploadFile → iris / SDXL
+    - JSON（影策 openai-images 声明式插件）：{model,prompt,images:[{image_url:dataURL}],...}
+      data URL 解码后按 model 路由（doubao → 上传 ref_image_key 图生图）
     """
-    if not image:
+    ctype = request.headers.get("content-type", "")
+    variant: Optional[str] = None
+    strength: Optional[float] = None
+    mask_data: Optional[bytes] = None
+    if ctype.startswith("application/json"):
+        payload = await request.json()
+        prompt = str(payload.get("prompt") or "")
+        model = payload.get("model") or None
+        size = payload.get("size") or None
+        seed = payload.get("seed")
+        seed = int(seed) if seed not in (None, "") else None
+        n = int(payload.get("n") or 1)
+        images = []
+        for it in payload.get("images") or []:
+            du = (it.get("image_url") if isinstance(it, dict) else it) or ""
+            if not str(du).startswith("data:"):
+                continue
+            images.append((base64.b64decode(str(du).split(",", 1)[1]), "ref.png"))
+    else:
+        form = await request.form()
+        prompt = str(form.get("prompt") or "")
+        model = form.get("model") or None
+        size = form.get("size") or None
+        variant = form.get("variant") or None
+        seed = form.get("seed")
+        seed = int(seed) if seed not in (None, "") else None
+        strength = form.get("strength")
+        strength = float(strength) if strength not in (None, "") else None
+        n = int(form.get("n") or 1)
+        images = [(await v.read(), v.filename or "ref.png")
+                  for k, v in form.multi_items() if k == "image" and hasattr(v, "read")]
+        mask_part = form.get("mask")
+        mask_data = await mask_part.read() if hasattr(mask_part, "read") else None
+
+    if not images:
         raise HTTPException(400, "at least one input image is required")
-    if len(image) > 16:
+    if len(images) > 16:
         raise HTTPException(400, "at most 16 reference images (iris MAX_INPUT_IMAGES)")
-    for up in image:
-        if up.size and up.size > 20 * 1024 * 1024:
-            raise HTTPException(413, f"reference image too large (>20MB): {up.filename}")
-    if mask is not None:
+    for data, fname in images:
+        if len(data) > 20 * 1024 * 1024:
+            raise HTTPException(413, f"reference image too large (>20MB): {fname}")
+    if mask_data is not None:
         raise HTTPException(400, "mask is not supported by the local image model")
-    n = max(1, min(int(n or 1), 4))
-    width, height = _parse_size(size)
+    if not prompt.strip():
+        raise HTTPException(400, "prompt is required")
+    n = max(1, min(n or 1, 4))
     # 豆包分支（影策参考素材链路）：参考图上传 → ref_image_key 图生图
     if model and model.lower().startswith("doubao"):
         daemon = os.environ.get("DOUBAO2API_URL", "http://127.0.0.1:8401")
-        ref_uri = None
-        for up in image:  # 豆包单参考图；多图时取第一张
-            ref_uri = _doubao_upload(daemon, await up.read(), up.filename or "ref.png")
-            break
-        if ref_uri is None:
-            raise HTTPException(400, "at least one input image is required")
-        body = {"model": "doubao-image", "prompt": prompt,
-                "size": size or "1024x1024", "ref_image_key": ref_uri}
+        data, fname = images[0]  # 豆包单参考图
+        ref_uri = _doubao_upload(daemon, data, fname)
+        body = {"model": "doubao-image", "prompt": prompt, "ref_image_key": ref_uri}
+        if size and ":" in size:
+            body["ratio"] = size  # 比例串（如 3:2）直接透传
+        else:
+            body["size"] = size or "1024x1024"
         if seed is not None:
             body["seed"] = seed
         r = urllib.request.Request(daemon + "/v1/images/generations",
@@ -253,12 +278,13 @@ async def images_edits(
                     img_b64 = base64.b64encode(ir.read()).decode()
             out.append({"b64_json": img_b64})
         return {"created": int(time.time()), "data": out}
-    # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重繪，無 h3/iris 依賴
+    # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重绘，无 h3/iris 依赖
     if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
+        width, height = _parse_size(size)
         daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
         tmpdir = tempfile.mkdtemp(prefix="mg_edits_sdxl_")
         try:
-            refs = [_save_ref(i, await up.read(), tmpdir) for i, up in enumerate(image)]
+            refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
             body = {"model": "realvis" if "realvis" in model.lower() else
                     ("noobai" if "noobai" in model.lower() else "sdxl"),
                     "prompt": prompt, "width": width, "height": height,
@@ -274,10 +300,10 @@ async def images_edits(
             return {"created": int(time.time()), "data": [{"b64_json": img}]}
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
-    n = max(1, min(int(n or 1), 4))
     tmpdir = tempfile.mkdtemp(prefix="mg_edits_")
     try:
-        refs = [_save_ref(i, await up.read(), tmpdir) for i, up in enumerate(image)]
+        width, height = _parse_size(size)
+        refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
         extra = {"width": width, "height": height, "input": refs}
         if variant:
             extra["variant"] = variant

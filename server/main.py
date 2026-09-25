@@ -9,11 +9,28 @@ import threading
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import core
 
 app = FastAPI(title="AI Media Gateway")
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_validation_errors(request, exc):
+    """422 的字段级 detail 落日志，方便定位上游（影策/画布）参数问题。"""
+    import logging
+    try:
+        body = (await request.body())[:400].decode("utf-8", "replace")
+    except Exception:
+        body = "<unreadable>"
+    logging.getLogger(__name__).error(
+        "422 %s %s content-type=%r body=%r: %s",
+        request.method, request.url.path,
+        request.headers.get("content-type"), body, str(exc.errors())[:400])
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 from .compat_h3cweb import router as compat_h3cweb_router  # noqa: E402 — h3cweb :8600 face
 app.include_router(compat_h3cweb_router)  # registered before /info below so old format wins
