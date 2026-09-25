@@ -17,6 +17,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -101,8 +102,16 @@ async def images_generations(req: ImageGenIn):
         r = urllib.request.Request(base + "/v1/images/generations",
                                    data=json.dumps(body).encode(),
                                    headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=600) as resp:
-            d = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(r, timeout=600) as resp:
+                d = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return JSONResponse(status_code=e.code, content={
+                "error": {"message": f"doubao2api: {e.read()[:200].decode('utf-8', 'replace')}",
+                          "type": "upstream_error"}})
+        except urllib.error.URLError as e:
+            return JSONResponse(status_code=502, content={
+                "error": {"message": f"doubao2api 不可达：{e}", "type": "upstream_error"}})
         return {"created": int(time.time()), "data": d.get("data", [])}
     # grok2api（:8402）：OpenAI 兼容直傳（Bearer = 網關客戶端密鑰）
     if req.model and req.model.lower().startswith("grok"):
@@ -113,12 +122,19 @@ async def images_generations(req: ImageGenIn):
                                    data=json.dumps(body).encode(),
                                    headers={"Content-Type": "application/json",
                                             **({"Authorization": f"Bearer {key}"} if key else {})})
-        with urllib.request.urlopen(r, timeout=600) as resp:
-            d = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(r, timeout=600) as resp:
+                d = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return JSONResponse(status_code=e.code, content={
+                "error": {"message": f"grok2api: {e.read()[:200].decode('utf-8', 'replace')}",
+                          "type": "upstream_error"}})
+        except urllib.error.URLError as e:
+            return JSONResponse(status_code=502, content={
+                "error": {"message": f"grok2api 不可达：{e}", "type": "upstream_error"}})
         return {"created": int(time.time()), "data": d.get("data", [])}
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：本地 daemon :8187，無 h3/iris 依賴
     if req.model and any(k in req.model.lower() for k in ("sdxl", "realvis", "noobai")):
-        import urllib.request
         daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
         body = {"model": "realvis" if "realvis" in req.model.lower() else
                 ("noobai" if "noobai" in req.model.lower() else "sdxl"),
@@ -193,7 +209,6 @@ async def images_edits(
     width, height = _parse_size(size)
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重繪，無 h3/iris 依賴
     if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
-        import urllib.request
         daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
         tmpdir = tempfile.mkdtemp(prefix="mg_edits_sdxl_")
         try:

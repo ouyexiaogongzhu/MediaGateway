@@ -12,12 +12,13 @@ from server.workers import seedvr2  # noqa: E402
 
 
 def test_cli_cmd_build():
-    cmd = seedvr2._cli_cmd("/tmp/in.mp4", "/tmp/out.mp4", "2160", "7b")
+    cmd = seedvr2._cli_cmd("/tmp/in.mp4", "/tmp/out.mp4", "2160", "7b", "fp16")
     assert cmd[1].endswith("inference_cli.py") and cmd[2] == "/tmp/in.mp4"
     assert cmd[cmd.index("--dit_model") + 1] == "seedvr2_ema_7b_fp16.safetensors"
+    assert seedvr2._cli_cmd("a", "b", "1080", "3b", "q8")[cmd.index("--dit_model") + 1].endswith("-Q8_0.gguf")
     assert cmd[cmd.index("--resolution") + 1] == "2160"
     assert cmd[cmd.index("--output") + 1] == "/tmp/out.mp4"
-    assert cmd[cmd.index("--batch_size") + 1] == "33"  # 4n+1
+    assert cmd[cmd.index("--batch_size") + 1] == "5"  # 4n+1，压 jetsam 峰值
 
 
 def test_run_validates(tmp_path=None):
