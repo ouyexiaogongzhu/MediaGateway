@@ -199,6 +199,8 @@ async def images_edits(request: Request):
     - JSON（影策 openai-images 声明式插件）：{model,prompt,images:[{image_url:dataURL}],...}
       data URL 解码后按 model 路由（doubao → 上传 ref_image_key 图生图）
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     ctype = request.headers.get("content-type", "")
     variant: Optional[str] = None
     strength: Optional[float] = None
@@ -219,6 +221,7 @@ async def images_edits(request: Request):
             images.append((base64.b64decode(str(du).split(",", 1)[1]), "ref.png"))
     else:
         form = await request.form()
+        _log.warning("images/edits form keys=%s ct=%r", list(form.keys()), ctype)
         prompt = str(form.get("prompt") or "")
         model = form.get("model") or None
         size = form.get("size") or None
@@ -228,13 +231,23 @@ async def images_edits(request: Request):
         strength = form.get("strength")
         strength = float(strength) if strength not in (None, "") else None
         n = int(form.get("n") or 1)
-        images = [(await v.read(), v.filename or "ref.png")
-                  for k, v in form.multi_items() if k == "image" and hasattr(v, "read")]
+        images = []
+        for k, v in form.multi_items():
+            # 影策 openai-images 插件用字段名 images（复数）；OpenAI 官方约定是 image
+            if k not in ("image", "images"):
+                continue
+            if hasattr(v, "read"):
+                images.append((await v.read(), v.filename or "ref.png"))
+            elif isinstance(v, str) and v.startswith("data:"):
+                try:
+                    images.append((base64.b64decode(v.split(",", 1)[1]), "ref.png"))
+                except Exception:
+                    pass
         mask_part = form.get("mask")
         mask_data = await mask_part.read() if hasattr(mask_part, "read") else None
 
     if not images:
-        raise HTTPException(400, "at least one input image is required")
+        raise HTTPException(400, f"at least one input image is required (parts: {list(form.keys()) if not ctype.startswith('application/json') else list(payload.keys())})")
     if len(images) > 16:
         raise HTTPException(400, "at most 16 reference images (iris MAX_INPUT_IMAGES)")
     for data, fname in images:
