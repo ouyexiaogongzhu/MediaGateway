@@ -26,6 +26,7 @@ os.environ["QWEN_IDLE_EXIT_S"] = "9999"  # keep the watchdog out of the tests
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from server import core, llm  # noqa: E402
+from server import compat_chat  # noqa: E402
 from server.compat_chat import router  # noqa: E402
 
 _app = FastAPI()
@@ -168,11 +169,33 @@ def test_chat_503_while_video_running():
     with_stub(go)
 
 
-def test_chat_rejects_stream():
+def test_chat_stream_local_emulated_sse():
     def go():
+        fresh_db()  # isolate from the 503 test's running-video fixture
         r = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}], "stream": True})
-        assert r.status_code == 400
+        assert r.status_code == 200, r.status_code
+        assert r.text.startswith("data: ")
+        assert "雨夜东京" in r.text
+        assert "data: [DONE]" in r.text
+    with_stub(go)
+
+
+def test_chat_stream_provider_passthrough():
+    def go():
+        fresh_db()
+        old = list(compat_chat._PROVIDERS)
+        compat_chat._PROVIDERS = [("grok", llm.BASE_URL, "")]
+        try:
+            r = client.post("/v1/chat/completions", json={
+                "model": "grok-chat-fast",
+                "messages": [{"role": "user", "content": "hi"}], "stream": True})
+            assert r.status_code == 200, r.status_code
+            body = json.loads(r.text)  # upstream body passed through verbatim
+            assert body["choices"][0]["message"]["content"] == "雨夜东京"
+            assert Stub.last_body["stream"] is True  # stream flag reaches upstream
+        finally:
+            compat_chat._PROVIDERS = old
     with_stub(go)
 
 
@@ -197,7 +220,8 @@ if __name__ == "__main__":
              test_no_llm_module_behaviour_unchanged,
              test_chat_forwards_to_upstream,
              test_chat_503_while_video_running,
-             test_chat_rejects_stream,
+             test_chat_stream_local_emulated_sse,
+             test_chat_stream_provider_passthrough,
              test_request_unload_defers_while_busy,
              test_unload_with_no_server_is_noop_true]
     for t in tests:
