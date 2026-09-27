@@ -17,7 +17,7 @@ MEM_GB = 20.0
 
 DEFAULT_HOME = os.environ.get("FLASHVSR_HOME", "/Users/vincent/tool/FlashVSR")
 DEFAULT_TIMEOUT = 3600.0
-_RESOLUTIONS = {"720", "1080"}
+_RESOLUTIONS = {"576", "720", "1080"}
 
 # ponytail: global lock — single Metal device; parallel runs unmeasured
 _run_lock = threading.Lock()
