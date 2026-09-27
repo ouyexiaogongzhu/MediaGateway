@@ -173,14 +173,13 @@ def test_v1_videos_first_frame_and_mute(client):
     """first_frame_image dataURL/本地路径 → params.first_frame（不入 refs）；mute_audio。"""
     r = client.post("/v1/videos", json={
         "prompt": "ff", "size": "864x480", "first_frame_image": _jpeg(b"FFDATA"),
-        "mute_audio": True, "input_images": [_jpeg(b"REFDATA")]})
+        "mute_audio": True})
     assert r.status_code == 200, r.text
     p = core.get_job(r.json()["id"])["params"]
     assert os.path.isfile(p["first_frame"])
     assert Path(p["first_frame"]).read_bytes() == b"FFDATA"
     assert p["mute_audio"] is True
-    assert len(p["refs"]) == 1
-    assert Path(p["refs"][0]["path"]).read_bytes() == b"REFDATA"
+    assert p["refs"] == []
     # 本地绝对路径直接透传；默认 mute_audio=False
     r2 = client.post("/v1/videos", json={
         "prompt": "ff2", "first_frame_image": os.path.join(_TMP, "in.png")})
@@ -192,6 +191,30 @@ def test_v1_videos_first_frame_and_mute(client):
     r3 = client.post("/v1/videos", json={
         "prompt": "ff3", "first_frame_image": "http://127.0.0.1:9/x.png"})
     assert r3.status_code == 400, r3.text
+
+
+def test_v1_videos_last_frame_image(client):
+    """last_frame_image（JSON + multipart）→ params.last_frame，FL2VA 尾帧链路。"""
+    r = client.post("/v1/videos", json={
+        "prompt": "lf", "first_frame_image": os.path.join(_TMP, "in.png"),
+        "last_frame_image": _jpeg(b"LASTDATA")})
+    assert r.status_code == 200, r.text
+    p = core.get_job(r.json()["id"])["params"]
+    assert Path(p["last_frame"]).read_bytes() == b"LASTDATA"
+    assert p["refs"] == []
+    # multipart 分支同样解析
+    r2 = client.post("/v1/videos", data={"prompt": "lf2", "last_frame_image": ""})
+    assert r2.status_code == 200, r2.text
+    assert core.get_job(r2.json()["id"])["params"]["last_frame"] is None
+
+
+def test_v1_videos_refs_frames_mutual_exclusion(client):
+    """input_images 与 first/last_frame_image 并发 → 400（h3 Ref2VA 会静默忽略帧，入口显式拒绝）。"""
+    payload = {"prompt": "mix", "input_images": [_jpeg(b"R")], "first_frame_image": os.path.join(_TMP, "in.png")}
+    r = client.post("/v1/videos", json=payload)
+    assert r.status_code == 400, r.text
+    r2 = client.post("/v1/videos", data={"prompt": "mix2", "input_images": _jpeg(b"R"), "last_frame_image": ""})
+    assert r2.status_code == 200, r2.text  # 空串 last_frame 不算帧，正常放行
 
 
 def test_v1_videos_malicious_new_fields(client):
@@ -281,6 +304,33 @@ def test_info_compat_shape(client):
     assert info["engine"] == "h3.c"
     assert info["device"] is None  # engine not resident between jobs (documented diff)
     assert info["model"]["dir"].endswith("MiniMax-H3")
+
+
+def test_aux_annotate(client):
+    """SDXL daemon aux 预处理（white/depth/lineart/pose）冒烟；:8187 不在线则跳过。"""
+    import struct
+    import urllib.request
+    import zlib
+    try:
+        urllib.request.urlopen(
+            os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187") + "/health", timeout=2)
+    except Exception:
+        print("SKIP test_aux_annotate (daemon :8187 offline)")
+        return
+
+    def png(w, h, rgb):  # stdlib minimal RGB PNG
+        raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+        chunk = lambda t, d: (struct.pack(">I", len(d)) + t + d
+                              + struct.pack(">I", zlib.crc32(t + d)))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+    du = "data:image/png;base64," + base64.b64encode(png(128, 128, (128, 110, 96))).decode()
+    for t in ("white", "depth", "lineart", "pose"):
+        r = client.post("/v1/aux", json={"type": t, "image": du, "width": 128, "height": 128})
+        assert r.status_code == 200, (t, r.status_code, r.text[:200])
+        out = base64.b64decode(r.json()["data"][0]["b64_json"])
+        assert struct.unpack(">II", out[16:24]) == (128, 128), t
 
 
 if __name__ == "__main__":

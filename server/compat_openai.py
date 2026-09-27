@@ -18,7 +18,6 @@ import subprocess
 import tempfile
 import time
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -94,26 +93,6 @@ async def images_generations(req: ImageGenIn):
     extra = {"width": width, "height": height}
     if req.variant:
         extra["variant"] = req.variant
-    # 豆包（doubao2api :8401）：免費生圖，size 直接透傳（daemon 自帶 ratio 換算）
-    if req.model and req.model.lower().startswith("doubao"):
-        base = os.environ.get("DOUBAO2API_URL", "http://127.0.0.1:8401")
-        body = {"prompt": req.prompt, "size": req.size or "1024x1024"}
-        if req.seed is not None:
-            body["seed"] = req.seed
-        r = urllib.request.Request(base + "/v1/images/generations",
-                                   data=json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(r, timeout=600) as resp:
-                d = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return JSONResponse(status_code=e.code, content={
-                "error": {"message": f"doubao2api: {e.read()[:200].decode('utf-8', 'replace')}",
-                          "type": "upstream_error"}})
-        except urllib.error.URLError as e:
-            return JSONResponse(status_code=502, content={
-                "error": {"message": f"doubao2api 不可达：{e}", "type": "upstream_error"}})
-        return {"created": int(time.time()), "data": d.get("data", [])}
     # grok2api（:8402）：OpenAI 兼容直傳（Bearer = 網關客戶端密鑰）
     if req.model and req.model.lower().startswith("grok"):
         base = os.environ.get("GROK2API_URL", "http://127.0.0.1:8402")
@@ -158,17 +137,6 @@ async def images_generations(req: ImageGenIn):
 _MAGIC_EXTS = ((b"\x89PNG", "png"), (b"\xff\xd8", "jpg"), (b"P5", "ppm"), (b"P6", "ppm"))
 
 
-def _doubao_upload(daemon: str, data: bytes, filename: str) -> str:
-    """上传参考图到 doubao2api，返回 uri（TOS 地址）。"""
-    b = uuid.uuid4().hex
-    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
-            f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + f"\r\n--{b}--\r\n".encode()
-    req = urllib.request.Request(daemon + "/v1/images/upload", data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        return json.loads(resp.read())["uri"]
-
-
 def _save_ref(idx: int, data: bytes, tmpdir: str) -> str:
     """iris 只读 8-bit 非隔行 PNG/JPEG/PPM；其余（webp/heic/16bit/隔行...）转成 PNG。"""
     for magic, ext in _MAGIC_EXTS:
@@ -197,11 +165,11 @@ async def images_edits(request: Request):
     """影策带参考图生图，双协议端点：
     - multipart（服务端 openai-image 路径）：Form + UploadFile → iris / SDXL
     - JSON（影策 openai-images 声明式插件）：{model,prompt,images:[{image_url:dataURL}],...}
-      data URL 解码后按 model 路由（doubao → 上传 ref_image_key 图生图）
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
     ctype = request.headers.get("content-type", "")
+    raw_body = await request.body()
     variant: Optional[str] = None
     strength: Optional[float] = None
     mask_data: Optional[bytes] = None
@@ -215,12 +183,26 @@ async def images_edits(request: Request):
         n = int(payload.get("n") or 1)
         images = []
         for it in payload.get("images") or []:
-            du = (it.get("image_url") if isinstance(it, dict) else it) or ""
-            if not str(du).startswith("data:"):
-                continue
-            images.append((base64.b64decode(str(du).split(",", 1)[1]), "ref.png"))
+            du = str((it.get("image_url") if isinstance(it, dict) else it) or "")
+            if du.startswith("data:"):
+                images.append((base64.b64decode(du.split(",", 1)[1]), "ref.png"))
+            elif du.startswith("http"):
+                # 影策 PurposeProvider：素材以画布签名 URL 形式传入，网关直接拉取
+                try:
+                    with urllib.request.urlopen(du, timeout=120) as ir:
+                        images.append((ir.read(), "ref.png"))
+                except Exception as e:
+                    raise HTTPException(400, f"fetch image_url failed: {str(e)[:120]}")
+            else:
+                _log.warning("images/edits: unsupported image_url: %.160r", du)
     else:
-        form = await request.form()
+        try:
+            form = await request.form()
+        except Exception as e:
+            _log.warning("images/edits multipart parse failed: %s; ct=%r; body head=%.600r",
+                         e, ctype, raw_body[:600])
+            raise HTTPException(400, f"multipart parse failed: {str(e)[:120]}; "
+                                     f"body head: {raw_body[:300].decode('utf-8', 'replace')}")
         _log.warning("images/edits form keys=%s ct=%r", list(form.keys()), ctype)
         prompt = str(form.get("prompt") or "")
         model = form.get("model") or None
@@ -233,16 +215,27 @@ async def images_edits(request: Request):
         n = int(form.get("n") or 1)
         images = []
         for k, v in form.multi_items():
-            # 影策 openai-images 插件用字段名 images（复数）；OpenAI 官方约定是 image
+            # 影策 openai-images 插件用字段名 images（复数）；OpenAI 官方约定是 image。
+            # 值可能是：文件、data URL、或画布签名素材 URL（http://…/api/public/resources/…）
             if k not in ("image", "images"):
                 continue
             if hasattr(v, "read"):
                 images.append((await v.read(), v.filename or "ref.png"))
-            elif isinstance(v, str) and v.startswith("data:"):
-                try:
-                    images.append((base64.b64decode(v.split(",", 1)[1]), "ref.png"))
-                except Exception:
-                    pass
+            elif isinstance(v, str):
+                t = v.strip()
+                if t.startswith("data:"):
+                    try:
+                        images.append((base64.b64decode(t.split(",", 1)[1]), "ref.png"))
+                    except Exception:
+                        _log.warning("images/edits: bad data URL in %s", k)
+                elif t.startswith("http"):
+                    try:
+                        with urllib.request.urlopen(t, timeout=120) as r:
+                            images.append((r.read(), "ref.png"))
+                    except Exception as e:
+                        _log.warning("images/edits: fetch %s url failed: %s", k, str(e)[:150])
+                else:
+                    _log.warning("images/edits: unsupported %s value: %.120r", k, t)
         mask_part = form.get("mask")
         mask_data = await mask_part.read() if hasattr(mask_part, "read") else None
 
@@ -258,39 +251,6 @@ async def images_edits(request: Request):
     if not prompt.strip():
         raise HTTPException(400, "prompt is required")
     n = max(1, min(n or 1, 4))
-    # 豆包分支（影策参考素材链路）：参考图上传 → ref_image_key 图生图
-    if model and model.lower().startswith("doubao"):
-        daemon = os.environ.get("DOUBAO2API_URL", "http://127.0.0.1:8401")
-        data, fname = images[0]  # 豆包单参考图
-        ref_uri = _doubao_upload(daemon, data, fname)
-        body = {"model": "doubao-image", "prompt": prompt, "ref_image_key": ref_uri}
-        if size and ":" in size:
-            body["ratio"] = size  # 比例串（如 3:2）直接透传
-        else:
-            body["size"] = size or "1024x1024"
-        if seed is not None:
-            body["seed"] = seed
-        r = urllib.request.Request(daemon + "/v1/images/generations",
-                                   data=json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(r, timeout=900) as resp:
-                d = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return JSONResponse(status_code=e.code, content={
-                "error": {"message": f"doubao2api: {e.read()[:200].decode('utf-8', 'replace')}",
-                          "type": "upstream_error"}})
-        except urllib.error.URLError as e:
-            return JSONResponse(status_code=502, content={
-                "error": {"message": f"doubao2api 不可达：{e}", "type": "upstream_error"}})
-        out = []
-        for it in d.get("data", []):
-            img_b64 = it.get("b64_json")
-            if not img_b64 and it.get("url"):
-                with urllib.request.urlopen(it["url"], timeout=120) as ir:
-                    img_b64 = base64.b64encode(ir.read()).decode()
-            out.append({"b64_json": img_b64})
-        return {"created": int(time.time()), "data": out}
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重绘，无 h3/iris 依赖
     if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
         width, height = _parse_size(size)
@@ -304,6 +264,13 @@ async def images_edits(request: Request):
                     "seed": seed if seed is not None else 0,
                     "init_image_path": refs[0],
                     "strength": strength if strength is not None else 0.45}
+            # model 含控制类型词 → ControlNet 路由：第一张参考图作 control 源
+            mlow = model.lower()
+            for ctype in ("openpose", "depth", "canny", "lineart", "white", "pose"):
+                if ctype in mlow:
+                    body["control_type"] = ctype
+                    body["control_image_path"] = refs[0]
+                    break
             r = urllib.request.Request(daemon + "/generate", data=json.dumps(body).encode(),
                                        headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(r, timeout=900) as resp:
@@ -324,6 +291,56 @@ async def images_edits(request: Request):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return {"created": int(time.time()), "data": data}
+
+
+@router.post("/v1/aux")
+async def aux_preprocess(request: Request):
+    """本地 aux 预处理（SDXL daemon :8187 /annotate，同步）：
+    white(白模/法线)/depth/lineart/pose(骨骼)/canny → 控制图 b64_json。
+    源图：JSON {type, image: dataURL|httpURL | image_path, width?, height?}
+    """
+    payload = await request.json()
+    a_type = str(payload.get("type") or "").lower()
+    if not a_type:
+        raise HTTPException(400, "type is required (white/depth/lineart/pose/canny)")
+    body = {"type": a_type}
+    w, h = int(payload.get("width") or 0), int(payload.get("height") or 0)
+    if w and h:
+        body["width"], body["height"] = w, h
+    src = payload.get("image_path")
+    tmpdir = None
+    if not src:
+        du = str(payload.get("image") or payload.get("image_url") or "")
+        if du.startswith("data:"):
+            raw = base64.b64decode(du.split(",", 1)[1])
+        elif du.startswith("http"):
+            try:
+                with urllib.request.urlopen(du, timeout=120) as ir:
+                    raw = ir.read()
+            except Exception as e:
+                raise HTTPException(400, f"fetch image failed: {str(e)[:120]}")
+        else:
+            raise HTTPException(400, "image (data URL / http URL) or image_path is required")
+        tmpdir = tempfile.mkdtemp(prefix="mg_aux_")
+        src = Path(tmpdir) / "in.png"
+        src.write_bytes(raw)
+    body["image_path"] = str(src)
+    daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
+    r = urllib.request.Request(daemon + "/annotate", data=json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(r, timeout=300) as resp:
+            d = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code, f"daemon: {e.read()[:200].decode('utf-8', 'replace')}")
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if not d.get("path"):
+        raise HTTPException(400, str(d)[:300])
+    with open(d["path"], "rb") as f:
+        img = base64.b64encode(f.read()).decode()
+    return {"created": int(time.time()), "type": d.get("type"), "data": [{"b64_json": img}]}
 
 
 def _wav_duration(path: str) -> float:

@@ -353,6 +353,35 @@ def extract_last_frame(video: str, output: str, timeout: float = DEFAULT_TIMEOUT
     return output
 
 
+# --- douyin_publish: 放大到抖音高清规格（1080x1920 + 高码率） ---
+# mode="cover"  裁边填充（同比例源无损失；比例不齐时裁掉多余边）
+# mode="contain 完整保留源画面，不足处加黑边
+def douyin_publish(
+    video: str,
+    output: str,
+    mode: str = "cover",
+    bitrate: str = "6000k",
+    timeout: float = DEFAULT_TIMEOUT,
+) -> str:
+    """h3 原生 768p 级 → 抖音高清上传规格（1080x1920、>=5000k h264）。"""
+    _check_file(video)
+    if mode not in ("cover", "contain"):
+        raise RenderError(f"mode 只支持 cover/contain，得到 {mode!r}")
+    vf = {
+        "cover": "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "contain": "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                   "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+    }[mode]
+    cmd = [_bin("ffmpeg", "FFMPEG_BIN"), "-y", "-v", "error", "-i", video,
+           "-vf", vf, "-r", "30",
+           "-c:v", "libx264", "-b:v", bitrate, "-maxrate", "8000k",
+           "-bufsize", "12000k", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", output]
+    _run(cmd, timeout)
+    _check_file(output)
+    return output
+
+
 # --- bgm: 多段音樂 crossfade 鏈成連續音軌，墊到視頻音軌下 ---
 # segments: [{"path": str, "duration_s": float}, ...]（有序；duration_s 僅為調用方
 # 提示值，鏈長以文件真實時長為準）。音樂短於視頻 aloop 循環補齊，長則 atrim。

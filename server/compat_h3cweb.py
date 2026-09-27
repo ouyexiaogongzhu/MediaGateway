@@ -65,6 +65,7 @@ class JobRequest(BaseModel):
     ssd_streaming: bool = False
     reference_image_size: Optional[int] = None
     first_frame: Optional[str] = None
+    last_frame: Optional[str] = None
     keep_loaded: bool = False
     mute_audio: bool = False
 
@@ -303,6 +304,7 @@ async def openai_create_video(request: Request):
     ct = request.headers.get("content-type", "")
     ref_paths: list[str] = []
     first_frame: Optional[str] = None
+    last_frame: Optional[str] = None
     keep_loaded: bool = False
     mute_audio = False
     if ct.startswith("multipart/") or ct.startswith("application/x-www-form"):
@@ -327,11 +329,16 @@ async def openai_create_video(request: Request):
         ffi = form.get("first_frame_image")
         if ffi is not None and str(ffi).strip():
             first_frame = _localize_image(ffi)
+        lfi = form.get("last_frame_image")
+        if lfi is not None and str(lfi).strip():
+            last_frame = _localize_image(lfi)
         mute_audio = _as_bool(form.get("mute_audio"))
         keep_loaded = _as_bool(form.get("keep_loaded"))
         ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
         if first_frame:
             first_frame = _shrink_ref_for_h3(first_frame)
+        if last_frame:
+            last_frame = _shrink_ref_for_h3(last_frame)
     else:
         try:
             raw = await request.json()
@@ -359,11 +366,16 @@ async def openai_create_video(request: Request):
         ffi = raw.get("first_frame_image")
         if ffi is not None and str(ffi).strip():
             first_frame = _localize_image(ffi)
+        lfi = raw.get("last_frame_image")
+        if lfi is not None and str(lfi).strip():
+            last_frame = _localize_image(lfi)
         mute_audio = _as_bool(raw.get("mute_audio"))
         keep_loaded = _as_bool(raw.get("keep_loaded"))
         ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
         if first_frame:
             first_frame = _shrink_ref_for_h3(first_frame)
+        if last_frame:
+            last_frame = _shrink_ref_for_h3(last_frame)
     prompt = re.sub(r"\s*\[IMAGE_\d+\]", "", str(raw.get("prompt") or "")).strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")
@@ -409,13 +421,7 @@ async def openai_create_video(request: Request):
         height -= height % 32
     if width < 32 or height < 32:
         raise HTTPException(400, "resolution too small")
-    # LTX-2.5 引擎路由（model 含 ltx）：MLX 22B，原生 AV 生成，無 h3 像素上限
     model_key = str(raw.get("model") or (form.get("model") if ct.startswith("multipart/") else "") or "")
-    if "ltx" in model_key.lower():
-        image_path = ref_paths[0] if ref_paths else first_frame
-        resp = core.create_job("ltx", {"prompt": prompt, "width": width, "height": height,
-                                       "seconds": seconds, "image_path": image_path})
-        return {"id": resp["id"], "task_id": resp["id"], "status": resp["status"]}
     # SDXL 圖片路由（model 含 sdxl/realvis/noobai）：本地 daemon，豎版 832x1216 默認，無 h3 像素上限
     if any(k in model_key.lower() for k in ("sdxl", "realvis", "noobai")):
         sp = {"prompt": prompt,
@@ -428,6 +434,10 @@ async def openai_create_video(request: Request):
         return {"id": resp["id"], "task_id": resp["id"], "status": resp["status"]}
     if width * height > 768 * 1344:
         raise HTTPException(400, "resolution exceeds h3 768*1344 pixel limit")
+    # h3.c:866 ref2va = reference_count != 0：有 refs 时首尾帧被静默忽略（h3_valid_params
+    # 的互斥报错要等 35GB 引擎加载完才触发）。在入口显式拒绝，把静默丢帧变成 fast 400。
+    if ref_paths and (first_frame or last_frame):
+        raise HTTPException(400, "input_images cannot be combined with first/last_frame_image (h3 Ref2VA ignores frame anchors)")
     resp = create_job(JobRequest(
         prompt=prompt, width=width, height=height, seconds=seconds,
         refs=[Ref(kind="image", path=p) for p in ref_paths]
@@ -435,7 +445,8 @@ async def openai_create_video(request: Request):
         # keep reference conditioning at native res (up to 2048px), not
         # stretched down to the render canvas
         reference_image_size=1 if ref_paths else 0,
-        first_frame=first_frame, mute_audio=mute_audio, keep_loaded=keep_loaded))
+        first_frame=first_frame, last_frame=last_frame,
+        mute_audio=mute_audio, keep_loaded=keep_loaded))
     return {"id": resp["job_id"], "task_id": resp["job_id"], "status": "queued"}
 
 
@@ -459,15 +470,28 @@ def openai_video_status(job_id: str, request: Request):
 
 @router.post("/v1/upscale")
 async def create_upscale(request: Request):
-    """SeedVR2 视频二次采样：multipart video+resolution（或 JSON video_path）→ 异步 job。"""
+    """FlashVSR 视频超分：multipart video+resolution（或 JSON video_path）→ 异步 job。
+    resolution 短边像素（720/1080）；model/precision 参数仅为旧协议兼容，已忽略。"""
+
+    def _timeout(value) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "timeout must be a number")
+
     ct = request.headers.get("content-type", "")
     video_path: Optional[str] = None
     resolution = "1080"
     model = "3b"
+    precision = "q8"
+    timeout = 14400.0
     if ct.startswith("multipart/") or ct.startswith("application/x-www-form"):
         form = await request.form(max_part_size=2 << 30)
         resolution = str(form.get("resolution") or resolution)
         model = str(form.get("model") or model)
+        precision = str(form.get("precision") or precision)
+        if form.get("timeout"):
+            timeout = _timeout(form.get("timeout"))
         up = form.get("video")
         if up is not None and hasattr(up, "read"):
             ext = os.path.splitext(getattr(up, "filename", "") or "")[1] or ".mp4"
@@ -480,10 +504,13 @@ async def create_upscale(request: Request):
         video_path = raw.get("video_path")
         resolution = str(raw.get("resolution") or resolution)
         model = str(raw.get("model") or model)
+        precision = str(raw.get("precision") or precision)
+        if raw.get("timeout"):
+            timeout = _timeout(raw.get("timeout"))
     if not video_path or not os.path.isfile(video_path):
         raise HTTPException(400, "video file missing")
-    resp = core.create_job("seedvr2", {"video_path": video_path,
-                                       "resolution": resolution, "model": model})
+    resp = core.create_job("flashvsr", {"video_path": video_path, "resolution": resolution,
+                                        "timeout": timeout})
     return {"id": resp["id"], "job_id": resp["id"], "status": resp["status"]}
 
 

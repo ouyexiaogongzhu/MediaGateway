@@ -132,3 +132,16 @@ Worker 为其子进程/线程；预算 36 + tts_server 空闲常驻 8.7 ≈ 物�
 2. **cancel 是协作语义** — 已进入不可中断段（生成中）的任务可能 cancel 后仍 completed；以最终 status 为准
 3. **freeze 定格尾段静音** — 音轨原样保留不延长；需要卡点带声先 mux 再 freeze
 4. **参数命名**：video 用 `seconds`，music 用 `duration_s`（历史约定，meta 字段名见各 worker 返回）
+
+## 交付记录（2026-09-04 部署后增量）
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| P10 镜头级连续性 | shot worker 返回 `last_frame_path`（mux 后 -sseof 抓尾帧）+ `concat` job 类型；影策 render-all 按尾帧接力串行渲染后拼成片 | E2E ✓（commit 31adb83 / 影策 ecb360e） |
+| P11 分镜音频架构 | TTS 暂停：对白走 h3 原生说话（口型对齐，keep_source_audio）；无台词剥音轨混 SFX 素材库（assets/sfx 40 类）；配乐段级 + concat | ✓（MG 858606d） |
+| P12 超分入口 | `POST /v1/upscale` → flashvsr worker（SeedVR2/Real-ESRGAN 弃用）；15s→1080p ≈5.3min | ✓ |
+| /v1/videos 契约扩展 | `input_images`（多值参考图，空条目过滤）、`first_frame_image`、`mute_audio`（strip_audio -c:v copy -an）；**input_images 与 first/last_frame_image 并发 → 400**（h3 有 refs 时帧被静默忽略）；mix worker 支持 audio_tracks | ✓ |
+| 引擎清理 | LTX-2.5 全删（worker/路由/权重 49GB）；doubao2api 删除（备份 github ouyexiaogongzhu/doubao2api） | ✓ |
+| aux 预处理四件套 | `POST /v1/aux`（白模/深度/线稿/骨骼）→ SDXL daemon /annotate；images/edits 模型名含控制类型词走 ControlNet（白模复用 depth CN） | ✓ |
+
+配套决策：视频超时/重试归影策 runtime_policy（videoTimeoutMinutes=200）+ query-provider 恢复已出片的 failed 任务；h3 画幅 9 官方档 + allowCustomSize（宽高 32 倍数、乘积 ≤768×1344）由影策 capabilityConfig 声明。

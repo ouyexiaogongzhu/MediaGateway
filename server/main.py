@@ -17,6 +17,10 @@ from . import core
 
 app = FastAPI(title="AI Media Gateway")
 
+import logging  # noqa: E402
+logging.basicConfig(level=logging.INFO)  # 让模块 logger 的 warning/info 落到 stderr
+print("=== MediaGateway restart marker ===", flush=True)
+
 
 @app.exception_handler(RequestValidationError)
 async def _log_validation_errors(request, exc):
