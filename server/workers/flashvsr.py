@@ -72,4 +72,5 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     if not out.is_file():
         raise Exception("flashvsr produced no output")
     return {"output_path": str(out), "resolution": resolution,
-            "engine": "flashvsr-v1.1-tiny", "recipe": "720p-diffusion" + ("+lanczos" if resolution == "1080" else "")}
+            "engine": "flashvsr-v1.1-tiny",
+            "recipe": f"{resolution}p-final" + ("" if resolution == "576" else "+lanczos")}
