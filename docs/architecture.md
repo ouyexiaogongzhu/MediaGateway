@@ -1,54 +1,33 @@
 # 影策系統架構（2026-09-28）
 
-> 四層：畫布 → 影策控制平面 → Gateway 媒體平面 → 引擎。qwen3.6-27b 已刪除（模型已棄用）。
+> 按 Worker 分流：畫布 → 影策 → Gateway（兼容面 → Queue）→ 7 個 Worker → 各自的引擎/模型。
+> qwen3.6-27b 已刪除；iris-image 已停用（被 qwen-image 頂替）；chatgpt2api 停用待帳號。
 
 ```mermaid
 %%{init:{"theme":"base","themeVariables":{"fontSize":"14px"}}}%%
-flowchart TB
-    subgraph L1["🖥 用戶端"]
-        UI["影策 Web :3000<br/>畫布：分鏡 · 生圖 · 視頻 · 超分按鈕 · 音頻"]
-    end
+flowchart LR
+    UI["🖥 影策 Web :3000<br/>分鏡 · 生圖 · 視頻 · 超分 · 音頻"]
+    Y["🎬 影策 Backend :8090<br/>渠道/模型目錄 · 任務系統<br/>Asset Store · /api/tools/upscale"]
+    GW["🚪 MediaGateway :8600<br/>OpenAI/newapi 兼容面<br/>Job Queue + Scheduler<br/>FIFO · MEM_GB 預算 · LLM↔視頻互斥<br/>stream：供應商透傳/本地模擬"]
 
-    subgraph L2["🎬 影策 Backend（控制平面）Go :8090"]
-        CH["渠道/模型目錄<br/>CHANNEL_000002 → :8600/v1"]
-        TASK["任務系統<br/>分鏡串接 P10 · 音頻 P11"]
-        TOOLS["/api/tools/upscale"]
-        AS[("Asset Store<br/>SQLite")]
-    end
+    V["video<br/>── h3.c worker ──<br/>引擎：MiniMax-H3（唯一）<br/>草稿 3.7min/5s · 15s ~15min"]
+    U["upscale<br/>── flashvsr worker ──<br/>FlashVSR（唯一超分）<br/>15s→1080 ~8.5min · NO_MASK"]
+    I["image<br/>── qwen_image worker ──<br/>sd.cpp Metal GGUF<br/>Qwen-Image-2.1 ~1.5min"]
+    C["chat 本地<br/>── qwen MLX :8000 ──<br/>qwen3.8-27b<br/>LLM↔視頻互斥 · idle 120s"]
+    CU["chat 無審查<br/>── omlx :8082 ──<br/>qwen3.8-uncensored<br/>oQ4e-mtp（mtplx 不兼容）"]
+    GK["chat/圖 外部<br/>── grok2api :8402 ──<br/>grok-chat-fast（web 帳號池）"]
+    A["audio<br/>── mlx-audio / cosyvoice ──<br/>qwen3-tts · C001 · C002"]
+    X["image/aux<br/>── SDXL daemon :8187 ──<br/>sdxl-noobai · sdxl-realvis<br/>aux 四件套"]
 
-    subgraph L3["🚪 MediaGateway（媒體平面）FastAPI :8600"]
-        API["OpenAI/newapi 兼容面<br/>chat · videos · images · audio · upscale · aux · models"]
-        Q["Job Queue + Scheduler<br/>FIFO · MEM_GB 預算 · LLM↔視頻互斥 · 用完即關<br/>stream：供應商透傳 / 本地模擬回放"]
-        RT{{"按模型名分流"}}
-        API --> Q --> RT
-    end
+    classDef once fill:#dbeafe,stroke:#3b82f6
+    classDef daemon fill:#dcfce7,stroke:#16a34a
+    class V,U,I once
+    class C,CU,GK,A,X daemon
 
-    subgraph W["⚙ Workers（用完即關）"]
-        direction LR
-        H3["h3.c 視頻<br/>MiniMax-H3 唯一"]
-        FV["FlashVSR 超分唯一<br/>15s→1080 ~8.5min"]
-        QI["sd.cpp Metal 生圖<br/>Qwen-Image-2.1 ~1.5min"]
-    end
-
-    subgraph D["🔌 常駐守護（手動管理）"]
-        direction LR
-        OM["omlx :8082<br/>3.8-uncensored"]
-        GK["grok2api :8402<br/>grok-chat-fast"]
-        QL["qwen MLX :8000<br/>3.8-27b"]
-        SD["SDXL :8187<br/>aux 四件套"]
-        C2["chatgpt2api :3001<br/>停用"]
-    end
-
-    UI -->|"cookie"| L2
-    L2 -->|"newapi / openai-* / chat"| L3
-    RT -->|"video / upscale / qwen* image"| W
-    RT -->|"unc / grok* / 3.8 / sdxl* / tts"| D
-
-    L1 ~~~ L2 ~~~ L3 ~~~ W ~~~ D
+    UI ==>|"cookie / 任務"| Y ==>|"兼容 REST"| GW
+    GW --> V & U & I & C & CU & GK & A & X
 ```
 
-**分流明細**：video→h3.c｜upscale→FlashVSR｜qwen* image→sd.cpp｜sdxl*/aux→SDXL daemon｜
-qwen3.8-uncensored→omlx :8082（模型名重寫為目錄全名）｜grok*→grok2api｜qwen3.8-27b→本地 MLX :8000
-
-**引擎備註**：qwen3.6-27b 已刪除（2026-09-28，模型棄用）；iris.c 已停用（flux-klein-9b 目錄失蹤，
-重下 ~30GB 可恢復）；chatgpt2api 停用待帳號；omlx / SDXL daemon 無 launchd，重啟機器後手動拉起
+**常駐守護運維**：omlx（run-aeon.sh）/ SDXL daemon 無 launchd——重啟機器後手動拉起；
+grok2api 有 launchd；qwen MLX :8000 由 Gateway llm.py 按需拉起。
+**已棄用**：qwen3.6-27b（刪除）、iris-image（enabled=0，重下 flux-klein-9b 可恢復）、chatgpt2api（待帳號）、SeedVR2/LTX（已刪）。
