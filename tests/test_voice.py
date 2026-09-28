@@ -80,14 +80,14 @@ def with_stub(scenario, fn):
 
 
 def test_ok_generates_file(url):
-    params = {"text": "你到底想点啊？", "voice": "C001", "speed": 1.1,
+    params = {"text": "你到底想点啊？", "voice": "suwan", "speed": 1.1,
               "base_url": url}
     res = run_worker(params, fresh_job_dir())
     out = res["output_path"]
     assert out.endswith("dialogue.wav"), out
     assert Path(out).read_bytes() == WAV
     assert res["sample_rate"] == 24000
-    v = json.loads((ROOT / "vendor/cosyvoice/voices.json").read_text())["C001"]
+    v = json.loads((ROOT / "vendor/cosyvoice/voices.json").read_text())["suwan"]
     p = Stub.last_payload
     assert p["text"] == "你到底想点啊？"
     assert p["speed"] == 1.1
@@ -99,7 +99,7 @@ def test_ok_generates_file(url):
 
 
 def test_4xx_no_retry(url):
-    params = {"text": "hi", "voice": "C001", "base_url": url}
+    params = {"text": "hi", "voice": "suwan", "base_url": url}
     try:
         run_worker(params, fresh_job_dir())
     except RuntimeError as e:  # SystemExit 必须已被转成普通异常
@@ -111,7 +111,7 @@ def test_4xx_no_retry(url):
 
 def test_5xx_retries_then_plain_exception(url):
     try:
-        run_worker({"text": "hi", "voice": "C001", "base_url": url},
+        run_worker({"text": "hi", "voice": "suwan", "base_url": url},
                    fresh_job_dir())
     except RuntimeError as e:
         assert "重试" in str(e) or "均失败" in str(e), str(e)

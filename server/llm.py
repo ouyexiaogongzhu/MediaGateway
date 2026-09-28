@@ -6,7 +6,7 @@ watchdog never kills mid-generation. An already-running server on the port
 is adopted (and CAN be killed on unload — unlike voice, 16GB vs video GPU
 memory is a hard mutual exclusion, see core._admit_next).
 
-Two model variants (qwen3.8 / qwen3.6) share one port; both ~19GB so only
+qwen3.8 (19GB) shares the port lifecycle pattern; only one resident at a time
 one is ever resident — ensure(key) unloads the other before spawning.
 """
 from __future__ import annotations
@@ -28,24 +28,9 @@ BASE_URL = os.environ.get("QWEN_BASE_URL", f"http://127.0.0.1:{PORT}")
 READY_TIMEOUT_S = float(os.environ.get("QWEN_READY_TIMEOUT_S", "300"))
 IDLE_EXIT_S = float(os.environ.get("QWEN_IDLE_EXIT_S", "120"))
 
-# model key → (serve-path resolver, peak RSS GB). qwen3.6 lives in the HF
-# cache (downloading); QWEN36_MODEL swaps the hub dirname for another variant.
-_QWEN36_HUB_NAME = os.environ.get(
-    "QWEN36_MODEL", "Youssofal--Qwen3.6-27B-Abliterated-Heretic-Uncensored-MLX-4bit")
-
-
-def _qwen36_path() -> str:
-    snaps = (Path.home() / ".cache/huggingface/hub"
-             / f"models--{_QWEN36_HUB_NAME}" / "snapshots")
-    for p in sorted(snaps.glob("*")):
-        if (p / "config.json").exists():
-            return str(p)
-    raise RuntimeError(f"qwen3.6 模型未下載完成（缺 {snaps}/*/config.json）")
-
-
+# model key → (serve-path resolver, peak RSS GB)
 _MODELS = {
     "qwen3.8-27b": (lambda: "/Users/vincent/tool/qwen/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed", 19.3),
-    "qwen3.6-27b": (_qwen36_path, 19.3),  # ponytail: 3.6 RSS 未实测，暂沿用 3.8 的 19.3，跑通后按峰值改
 }
 DEFAULT_MODEL = "qwen3.8-27b"
 

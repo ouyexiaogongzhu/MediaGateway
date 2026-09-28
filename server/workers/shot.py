@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 
 from .. import render
-from . import image as image_w
+from . import qwen_image as image_w  # iris 退役後改接 Qwen-Image-2.1（參數同構：prompt/width/height）
 from . import music as music_w
 from . import video as video_w
 from . import voice as voice_w

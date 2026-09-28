@@ -29,7 +29,6 @@ _KNOWN_MODELS = [
     "chatgpt",           # chat（chatgpt2api 別名）
     "qwen3.8-27b",       # chat（本地 MLX）
     "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault oQ4e-mtp 無審查）
-    "qwen3.6-27b",       # chat（本地 MLX，与 3.8 同端口互斥切换）
     "qwen3-tts",         # tts（mlx-audio）
     "cosyvoice",         # tts（cosyvoice 音色庫：system/suwan/aila，voice 參數選）
     "iris-image",        # image（本地 iris/sdxl）
@@ -93,8 +92,8 @@ def _ensure_omlx():
 
 
 def _local_key(model) -> str:
-    """本地 MLX 模型選型：qwen3.6* → qwen3.6-27b，其餘回退 qwen3.8-27b。"""
-    return "qwen3.6-27b" if (model or "").lower().startswith("qwen3.6") else llm.DEFAULT_MODEL
+    """本地 MLX 模型選型：非供應商前綴一律回退 qwen3.8-27b。"""
+    return llm.DEFAULT_MODEL
 
 
 def _route(model):
@@ -143,6 +142,7 @@ def chat_completions(req: ChatRequest):
     base, key = _route(req.model)
     if base is None:
         # 本地 qwen MLX：按需拉起 + 内存互斥（19GB LLM 与 35GB 视频引擎互斥）
+        body["model"] = _local_key(req.model)  # 轉發名與常駐服務一致（qwen3.6 等舊名回退 3.8）
         if _video_running():
             return _busy_response()
         try:

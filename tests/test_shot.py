@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from server.workers import image as image_w  # noqa: E402
+from server.workers import qwen_image as image_w  # noqa: E402（iris 退役改接 Qwen-Image-2.1）
 from server.workers import music as music_w  # noqa: E402
 from server.workers import shot  # noqa: E402
 from server.workers import video as video_w  # noqa: E402

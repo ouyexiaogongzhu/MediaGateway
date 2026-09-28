@@ -74,25 +74,10 @@ def _parse_size(size: Optional[str]) -> tuple[int, int]:
     return width, height
 
 
-async def _gen_images(prompt: str, n: int, seed: Optional[int], extra: dict) -> list[dict]:
-    data = []
-    for i in range(n):
-        params = {"prompt": prompt, **extra}
-        if seed is not None:
-            params["seed"] = seed + i
-        job = await _wait_job(core.create_job("image", params)["id"])
-        with open(job["output_path"], "rb") as f:
-            data.append({"b64_json": base64.b64encode(f.read()).decode()})
-    return data
-
-
 @router.post("/v1/images/generations")
 async def images_generations(req: ImageGenIn):
     n = max(1, min(int(req.n or 1), 4))
     width, height = _parse_size(req.size)
-    extra = {"width": width, "height": height}
-    if req.variant:
-        extra["variant"] = req.variant
     # grok2api（:8402）：OpenAI 兼容直傳（Bearer = 網關客戶端密鑰）
     if req.model and req.model.lower().startswith("grok"):
         base = os.environ.get("GROK2API_URL", "http://127.0.0.1:8402")
@@ -142,8 +127,9 @@ async def images_generations(req: ImageGenIn):
             img = base64.b64encode(f.read()).decode()
         return {"created": int(time.time()),
                 "data": [{"b64_json": img}] * 1}
-    return {"created": int(time.time()),
-            "data": await _gen_images(req.prompt, n, req.seed, extra)}
+    return JSONResponse(status_code=501, content={
+        "error": {"message": "iris 已退役（2026-09-28）；生圖請用 model=qwen-image-2.1 或 sdxl*/noobai/realvis",
+                  "type": "invalid_request_error"}})
 
 
 _MAGIC_EXTS = ((b"\x89PNG", "png"), (b"\xff\xd8", "jpg"), (b"P5", "ppm"), (b"P6", "ppm"))
@@ -292,17 +278,9 @@ async def images_edits(request: Request):
             return {"created": int(time.time()), "data": [{"b64_json": img}]}
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
-    tmpdir = tempfile.mkdtemp(prefix="mg_edits_")
-    try:
-        width, height = _parse_size(size)
-        refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
-        extra = {"width": width, "height": height, "input": refs}
-        if variant:
-            extra["variant"] = variant
-        data = await _gen_images(prompt, n, seed, extra)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    return {"created": int(time.time()), "data": data}
+    return JSONResponse(status_code=501, content={
+        "error": {"message": "iris 已退役（2026-09-28）；參考圖編輯請用 model 含 sdxl*/noobai/realvis（img2img/ControlNet）",
+                  "type": "invalid_request_error"}})
 
 
 @router.post("/v1/aux")

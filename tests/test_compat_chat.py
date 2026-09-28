@@ -243,30 +243,31 @@ def test_unload_with_no_server_is_noop_true():
     assert llm.resident() is False
 
 
-def test_qwen36_routing():
-    assert compat_chat._local_key("qwen3.6-27b") == "qwen3.6-27b"
-    assert compat_chat._local_key("Qwen3.6-Foo") == "qwen3.6-27b"
+def test_local_routing_defaults_to_qwen38():
+    # qwen3.6 已退役（2026-09-28）：任何非供應商前綴一律回退 qwen3.8-27b
+    assert compat_chat._local_key("qwen3.6-27b") == "qwen3.8-27b"
     assert compat_chat._local_key("qwen3.8-27b") == "qwen3.8-27b"
     assert compat_chat._local_key(None) == "qwen3.8-27b"
 
 
-def test_chat_forwards_qwen36_adopts_port():
+def test_chat_falls_back_qwen36_to_qwen38():
+    # qwen3.6 已退役（2026-09-28）：請求 qwen3.6 一律回退 qwen3.8-27b
     def go():
         fresh_db()
-        Stub.serving = "Youssofal--Qwen3.6-27B-Abliterated-Heretic-Uncensored-MLX-4bit"
         r = client.post("/v1/chat/completions", json={
             "model": "qwen3.6-27b",
             "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 200, r.text
-        assert Stub.last_body["model"] == "qwen3.6-27b"
-        assert llm._current == "qwen3.6-27b"  # adopt recorded the variant
+        assert Stub.last_body["model"] == "qwen3.8-27b"
+        assert llm._current == "qwen3.8-27b"
     with_stub(go)
 
 
 def test_serving_probe_matches_variant():
     def go():
-        Stub.serving = "Youssofal--Qwen3.6-27B-Abliterated-Heretic-Uncensored-MLX-4bit"
-        assert llm._serving("qwen3.6-27b") is True
+        Stub.serving = "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
+        assert llm._serving("qwen3.8-27b") is True
+        Stub.serving = "some-other-model"
         assert llm._serving("qwen3.8-27b") is False
         Stub.serving = Stub.DEFAULT_SERVING
         assert llm._serving("qwen3.8-27b") is True
@@ -286,8 +287,8 @@ if __name__ == "__main__":
              test_model_rewrite_case_insensitive,
              test_request_unload_defers_while_busy,
              test_unload_with_no_server_is_noop_true,
-             test_qwen36_routing,
-             test_chat_forwards_qwen36_adopts_port,
+             test_local_routing_defaults_to_qwen38,
+             test_chat_falls_back_qwen36_to_qwen38,
              test_serving_probe_matches_variant]
     for t in tests:
         t()

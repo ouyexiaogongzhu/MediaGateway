@@ -18,7 +18,9 @@ def test_payload_build():
     p = sdxl._payload({"prompt": "a cat"})
     assert p == {"model": "realvis", "prompt": "a cat", "negative_prompt": "",
                  "width": 832, "height": 1216, "steps": 30,
-                 "guidance_scale": 5.0, "seed": 0}
+                 "guidance_scale": 5.0, "seed": 0,
+                 "control_type": "", "control_image_path": None,
+                 "controlnet_scale": 0.8}
     p = sdxl._payload({"prompt": "x", "model": "noobai", "seed": 42, "width": 1024, "height": 1024})
     assert p["model"] == "noobai" and p["seed"] == 42 and p["width"] == 1024
     try:
