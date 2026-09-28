@@ -79,6 +79,8 @@ cd ~/tool/iris.c
 - `FLASHVSR_NO_MASK=1` 必开（稠密 SDPA：快 1.8×、无亮度漂移）；worker/CLI 已默认
 - 推理盒宽高都必须是 128 的倍数（VAE/8 × patch(1,2,2)，两空间维各 %8），推理后中心裁回精确尺寸
 - 分辨率族（32 网格精确比例）：竖 288×512/576×1024/1080×1920、横 512×288/1024×576/1920×1080
+- CLI 推理盒：`--target WxH`（128 倍数，推理后中心裁回）；`--scale 2` 会向 128 取整（576→512），精确档位用 --target；venv 在 `~/tool/FlashVSR/.venv`，跑法 `PYTHONPATH=~/tool/FlashVSR infer_mps.py in out --target WxH`
+- 用途扩展：VACE 動作遷移管线的后端超分工序（288×512→640×1152→576×1024，33帧 18s，见 §8）
 - SeedVR2（>2h/5s 片）与 Real-ESRGAN（逐帧条纹）已弃用；seedvr2 worker/tests/~/tool/seedvr2（11G）已于 2026-09-27 删除
 - 详见 memory `project_flashvsr_upscale.md`
 
@@ -87,6 +89,15 @@ cd ~/tool/iris.c
 - `~/tool/sdxl-daemon`（无 launchd，手动 nohup）；生图 + `POST /annotate`（白模/深度/线稿/骨骼，<2s/张）
 - Gateway `POST /v1/aux` 同步直通；images/edits 模型名含控制类型词即走 ControlNet（无官方 SDXL normal CN，白模复用 depth CN）
 - 坑：NormalBaeDetector 小图固定输出 512×512，daemon 已做尺寸归位
+
+## 8. VACE 動作遷移 — 視頻換角/替身（2026-09-28，sd.cpp Metal）
+
+- 位置：`~/tool/sd.cpp`（stable-diffusion.cpp，Metal 原生；编译需拉 ggml submodule + `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`）；权重 `~/tool/sd.cpp-models/`
+- 管线：源视频 → ffmpeg 16fps 抽帧 → Gateway `/v1/aux` pose（0.4s/帧）→ `sd-cli -M vid_gen`（VACE 控制视频 + 角色参考图）→ FlashVSR 超分 → 576×1024 H.264
+- 量产配置（双档）：草稿 = 1.3B v2-Q4_0 + CausVid LoRA 0.8 + TAEHV（45s/2s）；成品 = 14B LightX2V-VACE Q4_K_M（QuantStack，融合蒸馏免 LoRA）+ TAEHV（3min/2s、17min/9s 两窗）
+- 关键：`--tae taew2_1.safetensors`（Metal 快路，真 VAE 只能 CPU 且慢 2.5×）；单窗上限 81帧/5s（4n+1），分窗切点选镜头切换处；GGUF 只认 calcuis v2 系列（其余缺 vace 张量）；输出 MJPEG-AVI 需转 H.264
+- depth 控制已除名（会把源人物身形/服装轮廓锁进生成，换角色着必污染）
+- 样片：`~/tool/sd.cpp-test/test2/`（n9_final.mp4 = 9s 全片）；详见 memory `project_vace_motion.md`
 
 ## Uncensored Text Encoder(2026-09-07 已装)
 
