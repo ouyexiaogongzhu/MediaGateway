@@ -57,6 +57,20 @@ class FakeJob:
                 "output_path": self.output_file, "error": None}
 
 
+def test_ssrf_guard_blocks_internal_targets():
+    """LAN / link-local(169.254.169.254 metadata) 拒絕；loopback 放行（本地
+    canvas :8090 / SDXL :8187 / gateway /files 全是 loopback，by design）。"""
+    for url in ("http://192.168.1.5/x.png", "http://10.0.0.2/x.png",
+                "http://169.254.169.254/latest/meta-data/"):
+        try:
+            compat_openai._ssrf_check(url)
+        except Exception:
+            pass
+        else:
+            raise AssertionError(f"ssrf guard let through {url}")
+    compat_openai._ssrf_check("http://127.0.0.1:8600/files/x.mp4")  # loopback allowed
+
+
 def test_image_generations_returns_b64():
     with tempfile.TemporaryDirectory() as d:
         png = str(Path(d) / "out.png")

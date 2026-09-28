@@ -254,10 +254,12 @@ def _admit_next() -> tuple[str, dict] | None:
 
 def _run_job(worker, job: dict):
     jid = job["id"]
-    job_dir = ASSET_ROOT / jid
-    job_dir.mkdir(parents=True, exist_ok=True)
-    _update(jid, status="running", started_at=time.time())
     try:
+        # mkdir/_update inside the try: a failure here must fail the job, not
+        # leave it 'running' with no worker (poisons the memory budget forever)
+        job_dir = ASSET_ROOT / jid
+        job_dir.mkdir(parents=True, exist_ok=True)
+        _update(jid, status="running", started_at=time.time())
         result = worker.run(
             job["params"], job_dir,
             progress=lambda ratio, phase="": _update(jid, progress=ratio, phase=phase),
@@ -269,7 +271,7 @@ def _run_job(worker, job: dict):
                 output_path=result.get("output_path"),
                 meta={k: v for k, v in result.items() if k != "output_path"},
                 finished_at=time.time())
-    except Exception as e:  # noqa: BLE001
+    except BaseException as e:  # noqa: BLE001 — BaseException too: a dead thread must always fail its job
         status = "cancelled" if jid in _CANCELLED else "failed"
         _update(jid, status=status, error=str(e), finished_at=time.time())
     finally:
@@ -292,7 +294,11 @@ def scheduler_loop(poll_s: float = 0.5):
                     db().commit()
                 if cur.rowcount == 0:
                     continue
-                threading.Thread(target=_run_job, args=(worker, job), daemon=True).start()
+                try:
+                    threading.Thread(target=_run_job, args=(worker, job), daemon=True).start()
+                except Exception as e:  # noqa: BLE001 — row is 'running' with no worker
+                    _update(job["id"], status="failed", error=f"worker start failed: {e}",
+                            finished_at=time.time())
         except Exception as e:  # noqa: BLE001 — 一轮失败不能让队列线程静默死亡
             print(f"[core] scheduler round failed: {e}", flush=True)
         time.sleep(poll_s)

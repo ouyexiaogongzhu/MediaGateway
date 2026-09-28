@@ -100,6 +100,17 @@ def _port_pids() -> list[int]:
         return []
 
 
+def _foreign_on_port() -> bool:
+    """A live listener whose /v1/models lists no qwen model is not ours — the
+    unload sweep must not SIGKILL an unrelated local server. No /v1/models
+    answer => can't classify => sweep as before."""
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/v1/models", timeout=3) as r:
+            return "3.8" not in json.dumps(json.load(r))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _serving(key: str) -> bool:
     """Is the live port already serving `key`? Probed via /v1/models id
     substring (mtplx is OpenAI-compatible); probe failure → trust our
@@ -180,6 +191,13 @@ def unload() -> bool:
         proc.terminate()  # wrapper may not reap its server child — port sweep below catches that
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=3)
+    if proc is None and _port_pids() and _foreign_on_port():
+        # we never spawned this one; an adopted mtplx still answers /v1/models
+        # with its qwen id and gets swept as before, but a foreign server
+        # squatting the port is not ours to kill
+        print(f"[llm] :{PORT} held by a non-qwen server — unload refuses to kill it",
+              flush=True)
+        return False
     deadline = time.time() + 10
     while True:
         pids = _port_pids()

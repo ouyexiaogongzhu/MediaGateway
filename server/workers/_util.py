@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import time
 
 
 def number(params: dict, key: str, default, lo, hi, cast):
@@ -53,11 +54,18 @@ def run_cli(cmd: list[str], *, cwd: str, log_path: os.PathLike, env: dict | None
     with open(log_path, "w") as log:  # context manager: closed even on raise
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
                                 env=env, start_new_session=True)
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill(proc)
-            raise Exception(f"{engine} timeout after {timeout}s") from None
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                proc.wait(timeout=2)  # poll cancel() mid-run; SIGKILL needs no grace
+                break
+            except subprocess.TimeoutExpired:
+                if cancel():
+                    _kill(proc)
+                    raise Exception("cancelled") from None
+                if time.monotonic() >= deadline:
+                    _kill(proc)
+                    raise Exception(f"{engine} timeout after {timeout}s") from None
         if cancel():
             _kill(proc)
             raise Exception("cancelled")

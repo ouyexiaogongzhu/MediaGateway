@@ -26,6 +26,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -325,20 +326,21 @@ async def openai_create_video(request: Request):
                 f.write(await up.read())
             ref_paths.append(path)
         # 影策/newapi: input_images 多值（重复字段名或单字段 JSON 数组字符串）
-        ref_paths += _input_image_values(form.getlist("input_images"))
+        # 抓取/缩图都是阻塞 I/O——off the event loop（单进程网关，别冻住所有人）
+        ref_paths += await run_in_threadpool(_input_image_values, form.getlist("input_images"))
         ffi = form.get("first_frame_image")
         if ffi is not None and str(ffi).strip():
-            first_frame = _localize_image(ffi)
+            first_frame = await run_in_threadpool(_localize_image, ffi)
         lfi = form.get("last_frame_image")
         if lfi is not None and str(lfi).strip():
-            last_frame = _localize_image(lfi)
+            last_frame = await run_in_threadpool(_localize_image, lfi)
         mute_audio = _as_bool(form.get("mute_audio"))
         keep_loaded = _as_bool(form.get("keep_loaded"))
-        ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
+        ref_paths = [await run_in_threadpool(_shrink_ref_for_h3, p) for p in ref_paths]
         if first_frame:
-            first_frame = _shrink_ref_for_h3(first_frame)
+            first_frame = await run_in_threadpool(_shrink_ref_for_h3, first_frame)
         if last_frame:
-            last_frame = _shrink_ref_for_h3(last_frame)
+            last_frame = await run_in_threadpool(_shrink_ref_for_h3, last_frame)
     else:
         try:
             raw = await request.json()
@@ -362,20 +364,20 @@ async def openai_create_video(request: Request):
                     ref_paths.append(path)
         if offered and not ref_paths:
             raise HTTPException(400, "reference images not data URLs")
-        ref_paths += _input_image_values(raw.get("input_images"))
+        ref_paths += await run_in_threadpool(_input_image_values, raw.get("input_images"))
         ffi = raw.get("first_frame_image")
         if ffi is not None and str(ffi).strip():
-            first_frame = _localize_image(ffi)
+            first_frame = await run_in_threadpool(_localize_image, ffi)
         lfi = raw.get("last_frame_image")
         if lfi is not None and str(lfi).strip():
-            last_frame = _localize_image(lfi)
+            last_frame = await run_in_threadpool(_localize_image, lfi)
         mute_audio = _as_bool(raw.get("mute_audio"))
         keep_loaded = _as_bool(raw.get("keep_loaded"))
-        ref_paths = [_shrink_ref_for_h3(p) for p in ref_paths]
+        ref_paths = [await run_in_threadpool(_shrink_ref_for_h3, p) for p in ref_paths]
         if first_frame:
-            first_frame = _shrink_ref_for_h3(first_frame)
+            first_frame = await run_in_threadpool(_shrink_ref_for_h3, first_frame)
         if last_frame:
-            last_frame = _shrink_ref_for_h3(last_frame)
+            last_frame = await run_in_threadpool(_shrink_ref_for_h3, last_frame)
     prompt = re.sub(r"\s*\[IMAGE_\d+\]", "", str(raw.get("prompt") or "")).strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")

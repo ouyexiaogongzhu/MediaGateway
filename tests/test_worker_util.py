@@ -49,6 +49,36 @@ def test_util_not_in_registry():
         core._REGISTRY.clear()
 
 
+def test_run_cli_cancel_interrupts_child():
+    import tempfile
+    import time
+    from server.workers._util import run_cli
+    with tempfile.TemporaryDirectory() as d:
+        polls = iter([False, False, True])  # pre-Popen check, then two wait polls
+        t0 = time.monotonic()
+        try:
+            run_cli(["/bin/sleep", "30"], cwd=d, log_path=Path(d) / "log", env=None,
+                    timeout=60, cancel=lambda: next(polls, True), engine="t")
+        except Exception as e:
+            assert "cancelled" in str(e)
+        else:
+            raise AssertionError("expected cancelled")
+        assert time.monotonic() - t0 < 15  # killed mid-run, not waited to completion
+
+
+def test_run_cli_timeout():
+    import tempfile
+    from server.workers._util import run_cli
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            run_cli(["/bin/sleep", "30"], cwd=d, log_path=Path(d) / "log", env=None,
+                    timeout=2, cancel=lambda: False, engine="t")
+        except Exception as e:
+            assert "timeout" in str(e)
+        else:
+            raise AssertionError("expected timeout")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

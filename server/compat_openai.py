@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -30,6 +33,50 @@ from . import core
 router = APIRouter()
 
 _WAIT_TIMEOUT = 900
+
+
+def _ssrf_check(url: str) -> None:
+    """User-supplied fetch URLs: reject LAN / link-local (169.254.169.254
+    metadata) / reserved targets. Loopback stays allowed by design — the whole
+    flow is local (影策 canvas :8090, SDXL daemon :8187, gateway /files).
+    ponytail: resolve-then-fetch is TOCTOU; pin the connection if that matters."""
+    if os.environ.get("MG_FETCH_ALLOW_PRIVATE"):
+        return
+    host = urllib.parse.urlparse(url).hostname or ""
+    try:
+        addrinfos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise HTTPException(400, f"cannot resolve image host: {host}")
+    for ai in addrinfos:
+        ip = ipaddress.ip_address(ai[4][0])
+        if (ip.is_private and not ip.is_loopback) or ip.is_reserved or ip.is_multicast:
+            raise HTTPException(400, f"refusing to fetch non-public address: {host}")
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """A public URL must not be allowed to redirect into internal targets."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _ssrf_check(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_GuardedRedirect)
+
+
+def _fetch_bytes(url: str, timeout: float) -> bytes:
+    _ssrf_check(url)
+    with _OPENER.open(url, timeout=timeout) as r:
+        return r.read()
+
+
+def _post_json(url: str, body: dict, timeout: float,
+               headers: dict | None = None) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          **(headers or {})})
+    with _OPENER.open(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
 
 
 async def _wait_job(job_id: str, timeout: float = _WAIT_TIMEOUT) -> dict:
@@ -83,13 +130,10 @@ async def images_generations(req: ImageGenIn):
         base = os.environ.get("GROK2API_URL", "http://127.0.0.1:8402")
         key = os.environ.get("GROK_API_KEY", "")
         body = {"model": "grok-imagine-image", "prompt": req.prompt, "n": 1}
-        r = urllib.request.Request(base + "/v1/images/generations",
-                                   data=json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json",
-                                            **({"Authorization": f"Bearer {key}"} if key else {})})
         try:
-            with urllib.request.urlopen(r, timeout=600) as resp:
-                d = json.loads(resp.read())
+            d = await asyncio.to_thread(
+                _post_json, base + "/v1/images/generations", body, 600,
+                {"Authorization": f"Bearer {key}"} if key else None)
         except urllib.error.HTTPError as e:
             return JSONResponse(status_code=e.code, content={
                 "error": {"message": f"grok2api: {e.read()[:200].decode('utf-8', 'replace')}",
@@ -119,10 +163,7 @@ async def images_generations(req: ImageGenIn):
                 "steps": 30, "guidance_scale": 5.0}
         if req.seed is not None:
             body["seed"] = req.seed
-        r = urllib.request.Request(daemon + "/generate", data=json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=600) as resp:
-            d = json.loads(resp.read())
+        d = await asyncio.to_thread(_post_json, daemon + "/generate", body, 600)
         with open(d["path"], "rb") as f:
             img = base64.b64encode(f.read()).decode()
         return {"created": int(time.time()),
@@ -187,8 +228,7 @@ async def images_edits(request: Request):
             elif du.startswith("http"):
                 # 影策 PurposeProvider：素材以画布签名 URL 形式传入，网关直接拉取
                 try:
-                    with urllib.request.urlopen(du, timeout=120) as ir:
-                        images.append((ir.read(), "ref.png"))
+                    images.append((await asyncio.to_thread(_fetch_bytes, du, 120), "ref.png"))
                 except Exception as e:
                     raise HTTPException(400, f"fetch image_url failed: {str(e)[:120]}")
             else:
@@ -228,8 +268,7 @@ async def images_edits(request: Request):
                         _log.warning("images/edits: bad data URL in %s", k)
                 elif t.startswith("http"):
                     try:
-                        with urllib.request.urlopen(t, timeout=120) as r:
-                            images.append((r.read(), "ref.png"))
+                        images.append((await asyncio.to_thread(_fetch_bytes, t, 120), "ref.png"))
                     except Exception as e:
                         _log.warning("images/edits: fetch %s url failed: %s", k, str(e)[:150])
                 else:
@@ -269,10 +308,7 @@ async def images_edits(request: Request):
                     body["control_type"] = ctype
                     body["control_image_path"] = refs[0]
                     break
-            r = urllib.request.Request(daemon + "/generate", data=json.dumps(body).encode(),
-                                       headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(r, timeout=900) as resp:
-                d = json.loads(resp.read())
+            d = await asyncio.to_thread(_post_json, daemon + "/generate", body, 900)
             with open(d["path"], "rb") as f:
                 img = base64.b64encode(f.read()).decode()
             return {"created": int(time.time()), "data": [{"b64_json": img}]}
@@ -305,8 +341,7 @@ async def aux_preprocess(request: Request):
             raw = base64.b64decode(du.split(",", 1)[1])
         elif du.startswith("http"):
             try:
-                with urllib.request.urlopen(du, timeout=120) as ir:
-                    raw = ir.read()
+                raw = await asyncio.to_thread(_fetch_bytes, du, 120)
             except Exception as e:
                 raise HTTPException(400, f"fetch image failed: {str(e)[:120]}")
         else:
@@ -316,11 +351,8 @@ async def aux_preprocess(request: Request):
         src.write_bytes(raw)
     body["image_path"] = str(src)
     daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
-    r = urllib.request.Request(daemon + "/annotate", data=json.dumps(body).encode(),
-                               headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=300) as resp:
-            d = json.loads(resp.read())
+        d = await asyncio.to_thread(_post_json, daemon + "/annotate", body, 300)
     except urllib.error.HTTPError as e:
         raise HTTPException(e.code, f"daemon: {e.read()[:200].decode('utf-8', 'replace')}")
     finally:

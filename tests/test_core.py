@@ -54,6 +54,25 @@ def test_cancel_finished_job_returns_false():
     assert "f1" not in core._CANCELLED  # no zombie entry for finished jobs
 
 
+def test_run_job_fails_job_when_setup_raises():
+    """Regression: mkdir/_update 在 try 內 — setup 失敗必須把 job 標 failed，
+    而不是讓它永遠卡在 'running'（毒化 memory budget）。"""
+    db = _fresh_db()
+    db.execute("INSERT INTO jobs (id, type, status, created_at) "
+               "VALUES ('o1', 'video', 'running', 0)")
+    db.commit()
+    blocker = Path(tempfile.mkdtemp()) / "notadir"
+    blocker.write_text("x")  # mkdir 目标父路径是文件 => NotADirectoryError
+    old = core.ASSET_ROOT
+    core.ASSET_ROOT = blocker
+    try:
+        core._run_job(object(), {"id": "o1", "params": {}})  # worker 永远不会被调到
+    finally:
+        core.ASSET_ROOT = old
+    job = core.get_job("o1")
+    assert job["status"] == "failed" and job["error"], job
+
+
 def test_budget_counts_resident_engines():
     class FakeVideo:
         MEM_GB = 35.0
