@@ -202,6 +202,9 @@ def _resident_gb(reg: dict) -> float:
     llm_mod = sys.modules.get(_LLM_MODULE)  # absent => no LLM face loaded
     if llm_mod is not None and llm_mod.resident():
         gb += llm_mod.MEM_GB
+    chat_mod = sys.modules.get("server.compat_chat")  # omlx 16GB 同樣計入預算
+    if chat_mod is not None and getattr(chat_mod, "resident", lambda: False)():
+        gb += getattr(chat_mod, "MEM_GB", 0)
     return gb
 
 
@@ -225,7 +228,7 @@ def _admit_next() -> tuple[str, dict] | None:
         # => behaviour unchanged.
         if row["type"] in ("video", "shot"):
             blocked = False
-            for mod_name in (_LLM_MODULE, "server.workers.voice"):
+            for mod_name in (_LLM_MODULE, "server.compat_chat", "server.workers.voice"):
                 mod = sys.modules.get(mod_name)
                 if mod is None:
                     continue

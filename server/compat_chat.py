@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 
 import httpx
@@ -54,6 +55,48 @@ _MODEL_REWRITE = {"qwen3.8-uncensored": "pyros-vault_Qwen3.8-27B-Uncensored-oQ4e
 
 # omlx 按需供應商：pyros-vault oQ4e-mtp 只在此服務（mtplx 對該量化輸出亂碼）
 OMLX_BASE = "http://127.0.0.1:8082"
+OMLX_IDLE_EXIT_S = float(os.environ.get("OMLX_IDLE_EXIT_S", "120"))  # 對齊 qwen3.8 的 120s
+OMLX_MEM_GB = 16.0
+MEM_GB = OMLX_MEM_GB  # 調度器 face：core._resident_gb 按此計入預算
+_omlx_lock = threading.Lock()
+_omlx_proc = None
+_omlx_last_used = 0.0
+_omlx_watchdog_started = False
+_omlx_busy = 0           # chat 在飛——watchdog 絕不殺
+_omlx_spawning = False   # ensure() 拉起中——計入 resident
+_omlx_unload_pending = False  # core 為 video 要內存；下一個非 busy tick 開殺
+
+
+def busy() -> bool:
+    """chat 在飛或正在拉起——調度器視為不可殺。"""
+    return _omlx_busy > 0 or _omlx_spawning
+
+
+def resident() -> bool:
+    """16GB 佔用中（進程活著或在拉起）——調度器預算感知。"""
+    p = _omlx_proc
+    return (p is not None and p.poll() is None) or _omlx_spawning
+
+
+def request_unload() -> None:
+    """core 為 video/shot 讓路：下一個非 busy tick 殺掉自拉進程。"""
+    global _omlx_unload_pending
+    with _omlx_lock:
+        _omlx_unload_pending = True
+
+
+def _omlx_busy_enter():
+    global _omlx_busy, _omlx_last_used
+    with _omlx_lock:
+        _omlx_busy += 1
+        _omlx_last_used = time.time()
+
+
+def _omlx_busy_exit():
+    global _omlx_busy, _omlx_last_used
+    with _omlx_lock:
+        _omlx_busy = max(0, _omlx_busy - 1)
+        _omlx_last_used = time.time()
 
 
 def _omlx_up() -> bool:
@@ -67,24 +110,66 @@ def _omlx_up() -> bool:
         s.close()
 
 
+def _omlx_watchdog():
+    """qwen3.8(llm.py) 同款 idle-exit：只殺 gateway 自拉的進程；busy/unload_pending 優先。"""
+    global _omlx_proc, _omlx_unload_pending
+    while True:
+        time.sleep(15)
+        with _omlx_lock:
+            p = _omlx_proc
+            if p is None or p.poll() is not None:
+                _omlx_unload_pending = False
+                continue
+            due = _omlx_unload_pending or time.time() - _omlx_last_used > OMLX_IDLE_EXIT_S
+            if _omlx_busy > 0 or not due:
+                continue
+            _omlx_proc = None
+            _omlx_unload_pending = False
+        try:
+            p.terminate()
+            p.wait(timeout=10)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        print(f"[compat_chat] omlx exited (idle/unload → 用完即关)", flush=True)
+
+
 def _ensure_omlx():
     """omlx :8082 按需拉起：探活成功即返回；失敗才 spawn 並等就緒。
-    ponytail: 無 idle-exit——omlX 載入模型後常駐約 16GB（omlx memory-guard
-    自動卸載閒置模型），與 video 互斥場景若 OOM，加 tts 式 watchdog 即可。"""
-    if _omlx_up():
-        return
-    subprocess.Popen(
-        ["/opt/homebrew/opt/omlx/bin/omlx", "serve",
-         "--model-dir", "/Users/vincent/tool/qwen/models",
-         "--port", "8082", "--memory-guard", "safe"],
-        stdout=open("/tmp/omlx_8082.log", "a"), stderr=subprocess.STDOUT,
-        start_new_session=True)
-    deadline = time.time() + 300
-    while time.time() < deadline:
+    閒置 OMLX_IDLE_EXIT_S（或 video 請求讓路）由 watchdog 殺掉，冷啟 ~9s。"""
+    global _omlx_proc, _omlx_last_used, _omlx_watchdog_started, _omlx_spawning
+    with _omlx_lock:
+        _omlx_last_used = time.time()
+        if not _omlx_watchdog_started:
+            _omlx_watchdog_started = True
+            threading.Thread(target=_omlx_watchdog, daemon=True).start()
         if _omlx_up():
             return
-        time.sleep(2)
-    raise RuntimeError("omlx :8082 未能在 300s 內就緒 (log: /tmp/omlx_8082.log)")
+        if _omlx_unload_pending and _omlx_proc is not None:
+            raise RuntimeError("omlx unloading (video 互斥讓路中)，請稍後重試")
+        _omlx_spawning = True
+    try:
+        if _omlx_up():  # lock 外 double-check
+            return
+        with _omlx_lock:
+            _omlx_last_used = time.time()
+            proc = subprocess.Popen(
+                ["/opt/homebrew/opt/omlx/bin/omlx", "serve",
+                 "--model-dir", "/Users/vincent/tool/qwen/models",
+                 "--port", "8082", "--memory-guard", "safe"],
+                stdout=open("/tmp/omlx_8082.log", "a"), stderr=subprocess.STDOUT,
+                start_new_session=True)
+            _omlx_proc = proc
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            if _omlx_up():
+                return
+            time.sleep(2)
+        raise RuntimeError("omlx :8082 未能在 300s 內就緒 (log: /tmp/omlx_8082.log)")
+    finally:
+        _omlx_spawning = False
 
 
 def _local_key(model) -> str:
@@ -163,6 +248,7 @@ def chat_completions(req: ChatRequest):
         body["model"] = _MODEL_REWRITE.get(m.lower(), m)  # 路由大小寫不敏感，重寫也必須是
         if base == OMLX_BASE:
             _ensure_omlx()  # 按需：探活失敗才 spawn（19GB 進程不常駐）
+            _omlx_busy_enter()  # chat 在飛——watchdog 不殺
         if req.stream:
             # 供應商（grok2api/omlx）支持 SSE：逐塊透傳。
             # 上游中途出錯時 HTTP 已是 200，錯誤 JSON 會以原文出現在流裡，由前端解析。
@@ -180,12 +266,18 @@ def chat_completions(req: ChatRequest):
                     # 連不上/中途斷：headers 已發（200），只能把錯誤 JSON 塞進流裡
                     yield json.dumps({"error": {"message": f"供应商不可达：{e}",
                                                 "type": "upstream_error"}}).encode()
+                finally:
+                    if base == OMLX_BASE:
+                        _omlx_busy_exit()
             return StreamingResponse(sse(), media_type="text/event-stream")
         try:
             r = httpx.post(f"{base}/v1/chat/completions", json=body,
                            timeout=UPSTREAM_TIMEOUT_S, headers=headers)
         except httpx.HTTPError as e:
             return _upstream_error(f"供应商不可达：{e}")
+        finally:
+            if base == OMLX_BASE:
+                _omlx_busy_exit()
     try:
         payload = r.json()
     except ValueError:
