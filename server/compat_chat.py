@@ -29,7 +29,7 @@ _KNOWN_MODELS = [
     "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault oQ4e-mtp 無審查）
     "qwen3.6-27b",       # chat（本地 MLX，与 3.8 同端口互斥切换）
     "qwen3-tts",         # tts（mlx-audio）
-    "C001", "C002",      # tts（cosyvoice 音色）
+    "cosyvoice",         # tts（cosyvoice 音色庫：system/suwan/aila，voice 參數選）
     "iris-image",        # image（本地 iris/sdxl）
     "sdxl-noobai", "sdxl-realvis",  # image（本地 sdxl）
     "qwen-image-2.1",    # image（sd.cpp Metal，GGUF）
