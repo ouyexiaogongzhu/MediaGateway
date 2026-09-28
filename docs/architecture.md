@@ -1,7 +1,7 @@
 # 影策系統架構（2026-09-28）
 
 > 按功能合併：畫布 → 影策 → Gateway → 5 大能力域，每域列舉 worker/守護與模型。
-> 已棄用：qwen3.6-27b（刪除）、iris-image（停用）、chatgpt2api（停用待帳號）、SeedVR2/LTX（刪除）。
+> 已棄用：qwen3.6-27b（刪除）、iris-image（停用）、chatgpt2api（已刪除，上游 basketikun/chatgpt2api 可重克隆）、SeedVR2/LTX（刪除）。
 
 ```mermaid
 %%{init:{"theme":"base","themeVariables":{"fontSize":"14px"}}}%%
@@ -29,4 +29,4 @@ flowchart LR
 sdxl*→SDXL daemon｜/v1/chat qwen3.8-27b→MLX、qwen3.8-uncensored→omlx（名稱重寫）、grok*→grok2api｜
 /v1/audio qwen3-tts→mlx-audio、cosyvoice（voice=system/suwan/aila，缺省 system）
 
-**已棄用**：iris-image（enabled=0，重下 flux-klein-9b 可恢復）、qwen3.6-27b、chatgpt2api（待帳號）、SeedVR2/LTX
+**已棄用**：iris-image（enabled=0，重下 flux-klein-9b 可恢復）、qwen3.6-27b、chatgpt2api（已刪除，上游可重克隆）、SeedVR2/LTX

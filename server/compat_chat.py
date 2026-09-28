@@ -25,8 +25,6 @@ router = APIRouter()
 _KNOWN_MODELS = [
     "sora-2",            # video（newapi videos 協議）
     "grok-4.7",          # chat（grok2api :8402）
-    "gpt-5",             # chat（chatgpt2api :3001）
-    "chatgpt",           # chat（chatgpt2api 別名）
     "qwen3.8-27b",       # chat（本地 MLX）
     "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault oQ4e-mtp 無審查）
     "qwen3-tts",         # tts（mlx-audio）
@@ -47,8 +45,6 @@ UPSTREAM_TIMEOUT_S = 900.0  # cold load of the 19GB qwen takes minutes; don't 50
 
 # 云端供应商路由（model 前缀 → 本地 api2 守护进程）。未命中 → 本地 qwen MLX。
 _PROVIDERS = [
-    ("gpt-5", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
-    ("chatgpt", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
     ("grok", "http://127.0.0.1:8402", os.environ.get("GROK_API_KEY", "")),
     ("qwen3.8-uncensored", "http://127.0.0.1:8082", ""),  # omlx（pyros-vault oQ4e-mtp；mtplx 對此量化輸出亂碼）
 ]
@@ -168,7 +164,7 @@ def chat_completions(req: ChatRequest):
         if base == OMLX_BASE:
             _ensure_omlx()  # 按需：探活失敗才 spawn（19GB 進程不常駐）
         if req.stream:
-            # 供應商（grok2api/chatgpt2api）支持 SSE：逐塊透傳。
+            # 供應商（grok2api/omlx）支持 SSE：逐塊透傳。
             # 上游中途出錯時 HTTP 已是 200，錯誤 JSON 會以原文出現在流裡，由前端解析。
             def sse():
                 try:

@@ -4,3 +4,18 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+
+# repo 根目錄測試媒體/殘留（不入庫）
+/1.mp4
+/2.mp4
+/2.png
+/3.mp4
+/a.py
+/e2e_result.mp4
+/file.mp4
+/file_1080p.mp4
+/file_1080p_rerun.mp4
+/output*.mp4
+/t2_full_9s.mp4
+/t2_out.avi
+/server/jobs.db
