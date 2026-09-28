@@ -113,6 +113,17 @@ async def images_generations(req: ImageGenIn):
             return JSONResponse(status_code=502, content={
                 "error": {"message": f"grok2api 不可达：{e}", "type": "upstream_error"}})
         return {"created": int(time.time()), "data": d.get("data", [])}
+    # Qwen-Image-2.1 路由（model 含 qwen）：sd.cpp Metal worker，生圖 API 復活主引擎
+    if req.model and "qwen" in req.model.lower():
+        data = []
+        for i in range(n):
+            params = {"prompt": req.prompt, "width": width, "height": height}
+            if req.seed is not None:
+                params["seed"] = req.seed + i
+            job = await _wait_job(core.create_job("qwen_image", params)["id"])
+            with open(job["output_path"], "rb") as f:
+                data.append({"b64_json": base64.b64encode(f.read()).decode()})
+        return {"created": int(time.time()), "data": data}
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：本地 daemon :8187，無 h3/iris 依賴
     if req.model and any(k in req.model.lower() for k in ("sdxl", "realvis", "noobai")):
         daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")

@@ -26,10 +26,12 @@ _KNOWN_MODELS = [
     "gpt-5",             # chat（chatgpt2api :3001）
     "chatgpt",           # chat（chatgpt2api 別名）
     "qwen3.8-27b",       # chat（本地 MLX）
+    "qwen3.6-27b",       # chat（本地 MLX，与 3.8 同端口互斥切换）
     "qwen3-tts",         # tts（mlx-audio）
     "C001", "C002",      # tts（cosyvoice 音色）
     "iris-image",        # image（本地 iris/sdxl）
     "sdxl-noobai", "sdxl-realvis",  # image（本地 sdxl）
+    "qwen-image-2.1",    # image（sd.cpp Metal，GGUF）
 ]
 
 
@@ -47,6 +49,11 @@ _PROVIDERS = [
     ("chatgpt", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
     ("grok", "http://127.0.0.1:8402", os.environ.get("GROK_API_KEY", "")),
 ]
+
+
+def _local_key(model) -> str:
+    """本地 MLX 模型選型：qwen3.6* → qwen3.6-27b，其餘回退 qwen3.8-27b。"""
+    return "qwen3.6-27b" if (model or "").lower().startswith("qwen3.6") else llm.DEFAULT_MODEL
 
 
 def _route(model):
@@ -98,7 +105,7 @@ def chat_completions(req: ChatRequest):
         if _video_running():
             return _busy_response()
         try:
-            llm.ensure()
+            llm.ensure(_local_key(req.model))
         except RuntimeError as e:
             return _upstream_error(f"LLM 不可用：{e}")
         # re-check after the (possibly 10s+) spawn: a video job may have been
