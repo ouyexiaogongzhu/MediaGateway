@@ -7,10 +7,10 @@ always infer at 720p-class, lanczos finish to 1080 — 15s clip ≈ 5.2 min. Ins
 from __future__ import annotations
 
 import os
-import signal
-import subprocess
 import threading
 from pathlib import Path
+
+from ._util import number, run_cli, seed_of
 
 TYPE = "flashvsr"
 MEM_GB = 20.0
@@ -25,7 +25,6 @@ _run_lock = threading.Lock()
 
 def _cli_cmd(video_path: str, out_path: str, resolution: str, seed: int) -> list[str]:
     python = os.environ.get("FLASHVSR_PYTHON", os.path.join(DEFAULT_HOME, ".venv", "bin", "python"))
-    wd = os.path.join(DEFAULT_HOME, "examples", "WanVSR")
     return [python, "upscale_cli.py", video_path, out_path,
             "--resolution", resolution, "--seed", str(seed)]
 
@@ -37,38 +36,21 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     resolution = str(params.get("resolution") or "1080")
     if resolution not in _RESOLUTIONS:
         raise ValueError(f"unknown resolution: {resolution} (known: {sorted(_RESOLUTIONS)})")
-    seed = int(params.get("seed", 0))
+    seed = seed_of(params, 0)
+    timeout = number(params, "timeout", DEFAULT_TIMEOUT, 1.0, 4 * 3600.0, float)
 
     out = job_dir / "output.mp4"
-    if cancel():
-        raise Exception("cancelled")
     progress(0.05, "upscaling")
-    env = dict(os.environ, PYTHONPATH=DEFAULT_HOME)
-    # ponytail: log file + wait + killpg, never capture_output (OOM'd child holds the pipe)
-    log = out.parent / "flashvsr.log"
+    env = dict(os.environ)
+    # prepend, never clobber an inherited PYTHONPATH
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (DEFAULT_HOME, os.environ.get("PYTHONPATH")) if p)
     with _run_lock:
-        proc = subprocess.Popen(
-            _cli_cmd(video_path, str(out), resolution, seed),
-            cwd=os.path.join(DEFAULT_HOME, "examples", "WanVSR"),
-            stdout=open(log, "w"), stderr=subprocess.STDOUT,
-            env=env, start_new_session=True)
-        try:
-            proc.wait(timeout=float(params.get("timeout", DEFAULT_TIMEOUT)))
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-            raise Exception(f"flashvsr timeout after {params.get('timeout', DEFAULT_TIMEOUT)}s")
-        if cancel():
-            os.killpg(proc.pid, signal.SIGKILL)
-            raise Exception("cancelled")
+        run_cli(_cli_cmd(video_path, str(out), resolution, seed),
+                cwd=os.path.join(DEFAULT_HOME, "examples", "WanVSR"),
+                log_path=job_dir / "flashvsr.log", env=env,
+                timeout=timeout, cancel=cancel, engine="flashvsr")
     progress(0.95, "saving")
-    if proc.returncode != 0:
-        tail = ""
-        try:
-            tail = open(log, errors="ignore").read()[-500:]
-        except OSError:
-            pass
-        raise Exception(f"flashvsr exited {proc.returncode}: {tail}")
     if not out.is_file():
         raise Exception("flashvsr produced no output")
     return {"output_path": str(out), "resolution": resolution,

@@ -7,10 +7,10 @@
 from __future__ import annotations
 
 import os
-import signal
-import subprocess
 import threading
 from pathlib import Path
+
+from ._util import number, run_cli, seed_of
 
 TYPE = "qwen_image"
 MEM_GB = 10.0
@@ -20,6 +20,10 @@ DEFAULT_TIMEOUT = 1800.0
 
 # ponytail: global lock — single Metal device; parallel runs unmeasured
 _run_lock = threading.Lock()
+
+
+def _round32(v: int) -> int:
+    return max(32, v // 32 * 32)  # sd.cpp Qwen-Image requires dims % 32 == 0
 
 
 def _cli_cmd(prompt: str, out: Path, width: int, height: int,
@@ -43,42 +47,21 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     prompt = params.get("prompt")
     if not prompt:
         raise ValueError("prompt is required")
-    width = int(params.get("width") or 1024)
-    height = int(params.get("height") or 1024)
-    steps = int(params.get("steps") or 20)
-    cfg = float(params.get("cfg_scale") or 6.0)
-    seed = int(params.get("seed") or int.from_bytes(os.urandom(4), "little"))
+    width = _round32(number(params, "width", 1024, 32, 4096, int))
+    height = _round32(number(params, "height", 1024, 32, 4096, int))
+    steps = number(params, "steps", 20, 1, 150, int)
+    cfg = number(params, "cfg_scale", 6.0, 0.0, 30.0, float)
+    seed = seed_of(params, int.from_bytes(os.urandom(4), "little"))
+    timeout = number(params, "timeout", DEFAULT_TIMEOUT, 1.0, 4 * 3600.0, float)
 
     out = job_dir / "image.png"
-    if cancel():
-        raise Exception("cancelled")
     progress(0.05, "generating")
-    env = dict(os.environ)
-    # ponytail: log file + wait + killpg, never capture_output (dead child holds the pipe)
-    log = out.parent / "qwen_image.log"
     with _run_lock:
-        proc = subprocess.Popen(
-            _cli_cmd(prompt, out, width, height, steps, cfg, seed),
-            cwd=DEFAULT_HOME,
-            stdout=open(log, "w"), stderr=subprocess.STDOUT,
-            env=env, start_new_session=True)
-        try:
-            proc.wait(timeout=float(params.get("timeout", DEFAULT_TIMEOUT)))
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-            raise Exception(f"qwen_image timeout after {params.get('timeout', DEFAULT_TIMEOUT)}s")
-        if cancel():
-            os.killpg(proc.pid, signal.SIGKILL)
-            raise Exception("cancelled")
+        run_cli(_cli_cmd(prompt, out, width, height, steps, cfg, seed),
+                cwd=DEFAULT_HOME, log_path=job_dir / "qwen_image.log",
+                env=None,  # inherit environ
+                timeout=timeout, cancel=cancel, engine="qwen_image")
     progress(0.95, "saving")
-    if proc.returncode != 0:
-        tail = ""
-        try:
-            tail = open(log, errors="ignore").read()[-500:]
-        except OSError:
-            pass
-        raise Exception(f"qwen_image exited {proc.returncode}: {tail}")
     if not out.is_file():
         raise Exception("qwen_image produced no output")
     return {"output_path": str(out), "engine": "qwen-image-2.1",

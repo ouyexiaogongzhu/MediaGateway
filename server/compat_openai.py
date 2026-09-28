@@ -113,8 +113,9 @@ async def images_generations(req: ImageGenIn):
             return JSONResponse(status_code=502, content={
                 "error": {"message": f"grok2api 不可达：{e}", "type": "upstream_error"}})
         return {"created": int(time.time()), "data": d.get("data", [])}
-    # Qwen-Image-2.1 路由（model 含 qwen）：sd.cpp Metal worker，生圖 API 復活主引擎
-    if req.model and "qwen" in req.model.lower():
+    # Qwen-Image-2.1 路由（model 含 qwen-image）：sd.cpp Metal worker，生圖 API 復活主引擎
+    # （必須匹配 qwen-image 而非 qwen，否則 qwen3.8-27b 等 CHAT 模型名會被吞進生圖）
+    if req.model and "qwen-image" in req.model.lower():
         data = []
         for i in range(n):
             params = {"prompt": req.prompt, "width": width, "height": height}

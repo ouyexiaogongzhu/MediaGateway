@@ -127,19 +127,25 @@ def chat_completions(req: ChatRequest):
                 return _upstream_error(f"LLM upstream unreachable: {e}")
     else:
         headers = {"Authorization": f"Bearer {key}"} if key else {}
-        body["model"] = _MODEL_REWRITE.get(body.get("model"), body.get("model"))
+        m = body.get("model") or ""
+        body["model"] = _MODEL_REWRITE.get(m.lower(), m)  # 路由大小寫不敏感，重寫也必須是
         if req.stream:
             # 供應商（grok2api/chatgpt2api）支持 SSE：逐塊透傳。
             # 上游中途出錯時 HTTP 已是 200，錯誤 JSON 會以原文出現在流裡，由前端解析。
             def sse():
-                with httpx.stream("POST", f"{base}/v1/chat/completions",
-                                  json=body, headers=headers,
-                                  timeout=UPSTREAM_TIMEOUT_S) as r:
-                    if r.status_code != 200:
-                        yield r.read()
-                        return
-                    for chunk in r.iter_raw():
-                        yield chunk
+                try:
+                    with httpx.stream("POST", f"{base}/v1/chat/completions",
+                                      json=body, headers=headers,
+                                      timeout=UPSTREAM_TIMEOUT_S) as r:
+                        if r.status_code != 200:
+                            yield r.read()
+                            return
+                        for chunk in r.iter_raw():
+                            yield chunk
+                except httpx.HTTPError as e:
+                    # 連不上/中途斷：headers 已發（200），只能把錯誤 JSON 塞進流裡
+                    yield json.dumps({"error": {"message": f"供应商不可达：{e}",
+                                                "type": "upstream_error"}}).encode()
             return StreamingResponse(sse(), media_type="text/event-stream")
         try:
             r = httpx.post(f"{base}/v1/chat/completions", json=body,

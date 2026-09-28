@@ -39,6 +39,8 @@ client = TestClient(_app)
 class Stub(BaseHTTPRequestHandler):
     hits = 0
     last_body = None
+    DEFAULT_SERVING = "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed"
+    serving = DEFAULT_SERVING  # what the stubbed mtplx port claims to host
 
     def log_message(self, *a):
         pass
@@ -52,6 +54,9 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/v1/models":
+            self._send(200, {"object": "list", "data": [{"id": Stub.serving}]})
+            return
         self._send(200, {"ok": True})
 
     def do_POST(self):
@@ -64,6 +69,7 @@ class Stub(BaseHTTPRequestHandler):
 
 def with_stub(fn):
     Stub.hits = 0
+    Stub.serving = Stub.DEFAULT_SERVING
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
     url = f"http://127.0.0.1:{srv.server_address[1]}"
     old = llm.BASE_URL
@@ -199,6 +205,30 @@ def test_chat_stream_provider_passthrough():
     with_stub(go)
 
 
+def test_chat_stream_provider_unreachable_yields_error_json():
+    """上游連不上：SSE 已 200，錯誤 JSON 必須出現在流裡（而非靜默空流）。"""
+    def go():
+        fresh_db()
+        old = list(compat_chat._PROVIDERS)
+        compat_chat._PROVIDERS = [("grok", "http://127.0.0.1:9", "")]
+        try:
+            r = client.post("/v1/chat/completions", json={
+                "model": "grok-x", "messages": [{"role": "user", "content": "hi"}],
+                "stream": True})
+            assert r.status_code == 200, r.status_code
+            assert "upstream_error" in r.text, r.text
+        finally:
+            compat_chat._PROVIDERS = old
+    with_stub(go)
+
+
+def test_model_rewrite_case_insensitive():
+    assert compat_chat._MODEL_REWRITE.get("qwen3.8-uncensored".upper().lower()) is not None
+    m = "Qwen3.8-Uncensored"
+    assert compat_chat._MODEL_REWRITE.get(m.lower(), m) == \
+        compat_chat._MODEL_REWRITE["qwen3.8-uncensored"]
+
+
 def test_request_unload_defers_while_busy():
     llm._unload_pending = False
     with llm.busy_guard():
@@ -213,6 +243,36 @@ def test_unload_with_no_server_is_noop_true():
     assert llm.resident() is False
 
 
+def test_qwen36_routing():
+    assert compat_chat._local_key("qwen3.6-27b") == "qwen3.6-27b"
+    assert compat_chat._local_key("Qwen3.6-Foo") == "qwen3.6-27b"
+    assert compat_chat._local_key("qwen3.8-27b") == "qwen3.8-27b"
+    assert compat_chat._local_key(None) == "qwen3.8-27b"
+
+
+def test_chat_forwards_qwen36_adopts_port():
+    def go():
+        fresh_db()
+        Stub.serving = "Youssofal--Qwen3.6-27B-Abliterated-Heretic-Uncensored-MLX-4bit"
+        r = client.post("/v1/chat/completions", json={
+            "model": "qwen3.6-27b",
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200, r.text
+        assert Stub.last_body["model"] == "qwen3.6-27b"
+        assert llm._current == "qwen3.6-27b"  # adopt recorded the variant
+    with_stub(go)
+
+
+def test_serving_probe_matches_variant():
+    def go():
+        Stub.serving = "Youssofal--Qwen3.6-27B-Abliterated-Heretic-Uncensored-MLX-4bit"
+        assert llm._serving("qwen3.6-27b") is True
+        assert llm._serving("qwen3.8-27b") is False
+        Stub.serving = Stub.DEFAULT_SERVING
+        assert llm._serving("qwen3.8-27b") is True
+    with_stub(go)
+
+
 if __name__ == "__main__":
     tests = [test_mutex_blocks_video_while_llm_resident,
              test_mutex_releases_once_llm_gone,
@@ -222,8 +282,13 @@ if __name__ == "__main__":
              test_chat_503_while_video_running,
              test_chat_stream_local_emulated_sse,
              test_chat_stream_provider_passthrough,
+             test_chat_stream_provider_unreachable_yields_error_json,
+             test_model_rewrite_case_insensitive,
              test_request_unload_defers_while_busy,
-             test_unload_with_no_server_is_noop_true]
+             test_unload_with_no_server_is_noop_true,
+             test_qwen36_routing,
+             test_chat_forwards_qwen36_adopts_port,
+             test_serving_probe_matches_variant]
     for t in tests:
         t()
         print(f"PASS {t.__name__}")
