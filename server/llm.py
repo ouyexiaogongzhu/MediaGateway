@@ -1,14 +1,18 @@
-"""LLMManager: on-demand lifecycle for the local qwen3.8-27B MLX server (mtplx).
+"""LLMManager: on-demand lifecycle for the local qwen MLX servers (mtplx).
 
 Module singleton, same pattern as server/workers/voice.py: spawn on first
 chat request, idle-exit after QWEN_IDLE_EXIT_S, `_busy` guard so the
 watchdog never kills mid-generation. An already-running server on the port
 is adopted (and CAN be killed on unload — unlike voice, 16GB vs video GPU
 memory is a hard mutual exclusion, see core._admit_next).
+
+Two model variants (qwen3.8 / qwen3.6) share one port; both ~19GB so only
+one is ever resident — ensure(key) unloads the other before spawning.
 """
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shlex
 import signal
@@ -21,19 +25,45 @@ from pathlib import Path
 QWEN_DIR = Path(os.environ.get("QWEN_DIR", "/Users/vincent/tool/qwen"))
 PORT = int(os.environ.get("QWEN_PORT", "8000"))
 BASE_URL = os.environ.get("QWEN_BASE_URL", f"http://127.0.0.1:{PORT}")
-MEM_GB = float(os.environ.get("QWEN_MEM_GB", "19.3"))  # measured peak RSS
 READY_TIMEOUT_S = float(os.environ.get("QWEN_READY_TIMEOUT_S", "300"))
 IDLE_EXIT_S = float(os.environ.get("QWEN_IDLE_EXIT_S", "120"))
 
-_DEFAULT_CMD = (
-    "/opt/homebrew/bin/mtplx serve "
-    "--model /Users/vincent/tool/qwen/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed "
-    "--paged-kv-quant q8 "
-    f"--port {PORT}"
-)
-CMD = shlex.split(os.environ.get("QWEN_SERVE_CMD") or _DEFAULT_CMD)
+# model key → (serve-path resolver, peak RSS GB). qwen3.6 lives in the HF
+# cache (downloading); QWEN36_MODEL swaps the hub dirname for another variant.
+_QWEN36_HUB_NAME = os.environ.get(
+    "QWEN36_MODEL", "Youssofal--Qwen3.6-27B-Abliterated-Heretic-Uncensored-MLX-4bit")
+
+
+def _qwen36_path() -> str:
+    snaps = (Path.home() / ".cache/huggingface/hub"
+             / f"models--{_QWEN36_HUB_NAME}" / "snapshots")
+    for p in sorted(snaps.glob("*")):
+        if (p / "config.json").exists():
+            return str(p)
+    raise RuntimeError(f"qwen3.6 模型未下載完成（缺 {snaps}/*/config.json）")
+
+
+_MODELS = {
+    "qwen3.8-27b": (lambda: "/Users/vincent/tool/qwen/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed", 19.3),
+    "qwen3.6-27b": (_qwen36_path, 19.3),  # ponytail: 3.6 RSS 未实测，暂沿用 3.8 的 19.3，跑通后按峰值改
+}
+DEFAULT_MODEL = "qwen3.8-27b"
+
+# scheduler (core._admit_next) reads this attr every poll — ensure() keeps it
+# in sync with whichever model is resident (only one ever is)
+MEM_GB = _MODELS[DEFAULT_MODEL][1]
+
+
+def _cmd(key: str) -> list[str]:
+    override = os.environ.get("QWEN_SERVE_CMD")
+    if override:  # full manual override, same for every key
+        return shlex.split(override)
+    return ["/opt/homebrew/bin/mtplx", "serve", "--model", _MODELS[key][0](),
+            "--paged-kv-quant", "q8", "--port", str(PORT)]
+
 
 _proc: subprocess.Popen | None = None
+_current: str | None = None  # model key the port is believed to be serving
 _last_use = 0.0
 _busy = False           # a chat completion is in flight — never kill while set
 _loading = False        # ensure() is spawning/waiting for readiness — counts as resident
@@ -85,22 +115,52 @@ def _port_pids() -> list[int]:
         return []
 
 
-def ensure(timeout: float = READY_TIMEOUT_S):
-    """Server ready for a chat request: adopt an external one or spawn ours."""
-    global _last_use, _proc, _unload_pending, _loading
+def _serving(key: str) -> bool:
+    """Is the live port already serving `key`? Probed via /v1/models id
+    substring (mtplx is OpenAI-compatible); probe failure → trust our
+    _current bookkeeping instead of killing a working server on a guess."""
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/v1/models", timeout=3) as r:
+            ids = json.dumps(json.load(r))
+    except Exception:  # noqa: BLE001 — no /v1/models / not up == fall back
+        return _current == key
+    return ("3.6" if "3.6" in key else "3.8") in ids
+
+
+def ensure(key: str = DEFAULT_MODEL, timeout: float = READY_TIMEOUT_S):
+    """Server for `key` ready for a chat request: adopt it if already served,
+    swap out the other model first if it holds the port."""
+    global _last_use, _proc, _unload_pending, _loading, _current, MEM_GB
     with _lock:
         _last_use = time.time()
         _unload_pending = False
+        if key not in _MODELS:
+            raise RuntimeError(f"unknown LLM model key: {key}")
     if _healthy():
-        return
+        if _current == key or _serving(key):
+            with _lock:
+                _current = key
+                MEM_GB = _MODELS[key][1]
+            return
+        # another variant holds the port — 19GB×2 doesn't fit, swap it out;
+        # unload defers while a chat is mid-flight, so poll until dark
+        deadline = time.time() + 30
+        while _healthy() and time.time() < deadline:
+            unload()
+            time.sleep(0.5)
+        if _healthy():
+            raise RuntimeError("LLM 模型切换中（另一模型生成未结束），稍后重试")
     with _lock:
         # counts as resident() so the scheduler won't admit a 35GB video job
         # while we're mid-spawn (TOCTOU: port isn't bound yet)
         _loading = True
+        _current = key
+        MEM_GB = _MODELS[key][1]
+        _unload_pending = False  # a swap's deferred unload must not kill the new spawn
         if _proc is None or _proc.poll() is not None:
             with open(QWEN_DIR / "serve.log", "a") as log:
-                log.write(f"\n[llm.py] spawn {time.strftime('%F %T')} {' '.join(CMD)}\n")
-            _proc = subprocess.Popen(CMD, cwd=QWEN_DIR,
+                log.write(f"\n[llm.py] spawn {key} {time.strftime('%F %T')} {' '.join(_cmd(key))}\n")
+            _proc = subprocess.Popen(_cmd(key), cwd=QWEN_DIR,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.time() + timeout
@@ -121,7 +181,7 @@ def ensure(timeout: float = READY_TIMEOUT_S):
 
 def unload() -> bool:
     """Stop the server and free its memory. Returns True once the port is dark."""
-    global _proc, _unload_pending, _known, _checked
+    global _proc, _unload_pending, _known, _checked, _current
     with _lock:
         if _busy or _loading:
             # never kill mid-generation or mid-spawn; watchdog retries later
@@ -129,6 +189,7 @@ def unload() -> bool:
             return False
         _unload_pending = False
         proc, _proc = _proc, None
+        _current = None
         _known, _checked = False, 0.0
     if proc is not None and proc.poll() is None:
         proc.terminate()  # wrapper may not reap its server child — port sweep below catches that

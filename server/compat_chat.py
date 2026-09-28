@@ -26,6 +26,7 @@ _KNOWN_MODELS = [
     "gpt-5",             # chat（chatgpt2api :3001）
     "chatgpt",           # chat（chatgpt2api 別名）
     "qwen3.8-27b",       # chat（本地 MLX）
+    "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault oQ4e-mtp 無審查）
     "qwen3.6-27b",       # chat（本地 MLX，与 3.8 同端口互斥切换）
     "qwen3-tts",         # tts（mlx-audio）
     "C001", "C002",      # tts（cosyvoice 音色）
@@ -48,7 +49,11 @@ _PROVIDERS = [
     ("gpt-5", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
     ("chatgpt", "http://127.0.0.1:3001", os.environ.get("CHATGPT2API_KEY", "local-chatgpt2api")),
     ("grok", "http://127.0.0.1:8402", os.environ.get("GROK_API_KEY", "")),
+    ("qwen3.8-uncensored", "http://127.0.0.1:8082", ""),  # omlx（pyros-vault oQ4e-mtp；mtplx 對此量化輸出亂碼）
 ]
+
+# 供應商側模型名重寫（影策 key → 上游 omlx 目錄 id）
+_MODEL_REWRITE = {"qwen3.8-uncensored": "pyros-vault_Qwen3.8-27B-Uncensored-oQ4e-mtp"}
 
 
 def _local_key(model) -> str:
@@ -122,6 +127,7 @@ def chat_completions(req: ChatRequest):
                 return _upstream_error(f"LLM upstream unreachable: {e}")
     else:
         headers = {"Authorization": f"Bearer {key}"} if key else {}
+        body["model"] = _MODEL_REWRITE.get(body.get("model"), body.get("model"))
         if req.stream:
             # 供應商（grok2api/chatgpt2api）支持 SSE：逐塊透傳。
             # 上游中途出錯時 HTTP 已是 200，錯誤 JSON 會以原文出現在流裡，由前端解析。
