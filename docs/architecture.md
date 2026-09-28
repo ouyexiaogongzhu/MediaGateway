@@ -14,7 +14,7 @@ flowchart LR
     UP["🔍 超分（用完即關）<br/>── flashvsr worker ──<br/>FlashVSR 唯一超分<br/>15s→1080 ~8.5min · NO_MASK"]
     IMG["🖼 生圖+aux<br/>── qwen_image worker（用完即關）──<br/>sd.cpp Metal → Qwen-Image-2.1 ~1.5min<br/>── SDXL daemon :8187（常駐）──<br/>sdxl-noobai · sdxl-realvis · aux 四件套"]
     TXT["💬 文本（3 路守護）<br/>── qwen MLX :8000（按需/idle 120s）──<br/>qwen3.8-27b<br/>── omlx :8082（常駐）──<br/>qwen3.8-uncensored（oQ4e-mtp）<br/>── grok2api :8402（launchd）──<br/>grok-chat-fast（web 帳號池）"]
-    AUD["🔊 音頻（按需/守護）<br/>── mlx-audio ── qwen3-tts<br/>── cosyvoice ── C001 · C002"]
+    AUD["🔊 音頻<br/>── cosyvoice（單模型多音色）──<br/>system 默認 · suwan 粵 · aila 普<br/>── mlx-audio ── qwen3-tts"]
 
     classDef once fill:#dbeafe,stroke:#3b82f6
     classDef daemon fill:#dcfce7,stroke:#16a34a
@@ -27,6 +27,6 @@ flowchart LR
 
 **分流明細**：/v1/videos→h3.c｜/v1/upscale→FlashVSR｜/v1/images qwen-image*→sd.cpp、
 sdxl*→SDXL daemon｜/v1/chat qwen3.8-27b→MLX、qwen3.8-uncensored→omlx（名稱重寫）、grok*→grok2api｜
-/v1/audio qwen3-tts→mlx-audio、C001/C002→cosyvoice
+/v1/audio qwen3-tts→mlx-audio、cosyvoice（voice=system/suwan/aila，缺省 system）
 
 **已棄用**：iris-image（enabled=0，重下 flux-klein-9b 可恢復）、qwen3.6-27b、chatgpt2api（待帳號）、SeedVR2/LTX
