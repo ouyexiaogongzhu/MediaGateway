@@ -288,6 +288,21 @@ async def images_edits(request: Request):
     if not prompt.strip():
         raise HTTPException(400, "prompt is required")
     n = max(1, min(n or 1, 4))
+    # Qwen-Image-2.1 路由（model 含 qwen-image）：图+文编辑（-r 参考图），走 qwen_image worker
+    if model and "qwen-image" in model.lower():
+        width, height = _parse_size(size)
+        tmpdir = tempfile.mkdtemp(prefix="mg_edits_qwen_")
+        try:
+            refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
+            params = {"prompt": prompt, "width": width, "height": height, "refs": refs}
+            if seed is not None:
+                params["seed"] = seed
+            job = await _wait_job(core.create_job("qwen_image", params)["id"])
+            with open(job["output_path"], "rb") as f:
+                img = base64.b64encode(f.read()).decode()
+            return {"created": int(time.time()), "data": [{"b64_json": img}]}
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
     # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重绘，无 h3/iris 依赖
     if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
         width, height = _parse_size(size)
@@ -309,6 +324,8 @@ async def images_edits(request: Request):
                     body["control_image_path"] = refs[0]
                     break
             d = await asyncio.to_thread(_post_json, daemon + "/generate", body, 900)
+            if not d.get("path"):
+                raise HTTPException(400, f"sdxl daemon: {str(d)[:200]}")
             with open(d["path"], "rb") as f:
                 img = base64.b64encode(f.read()).decode()
             return {"created": int(time.time()), "data": [{"b64_json": img}]}
