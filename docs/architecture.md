@@ -13,7 +13,7 @@ flowchart LR
     VIDEO["🎬 視頻（用完即關）<br/>── h3.c worker ──<br/>MiniMax-H3 唯一引擎<br/>32網格 · 5+17n · 草稿3.7min/5s"]
     UP["🔍 超分（用完即關）<br/>── flashvsr worker ──<br/>FlashVSR 唯一超分<br/>15s→1080 ~8.5min · NO_MASK"]
     IMG["🖼 生圖+aux<br/>── qwen_image worker（用完即關）──<br/>sd.cpp Metal → Qwen-Image-2.1 ~1.5min<br/>── SDXL daemon :8187（常駐）──<br/>sdxl-noobai · sdxl-realvis · aux 四件套"]
-    TXT["💬 文本（3 路守護）<br/>── qwen MLX :8000（按需/idle 120s）──<br/>qwen3.8-27b<br/>── omlx :8082（常駐）──<br/>qwen3.8-uncensored（oQ4e-mtp）<br/>── grok2api :8402（launchd）──<br/>grok-chat-fast（web 帳號池）"]
+    TXT["💬 文本（3 路守護）<br/>── qwen MLX :8000（按需/idle 120s）──<br/>qwen3.8-27b<br/>── omlx :8082（按需拉起）──<br/>qwen3.8-uncensored（oQ4e-mtp）<br/>── grok2api :8402（launchd）──<br/>grok-chat-fast（web 帳號池）"]
     AUD["🔊 音頻<br/>── cosyvoice（單模型多音色）──<br/>system 默認 · suwan 粵 · aila 普<br/>── mlx-audio ── qwen3-tts"]
 
     classDef once fill:#dbeafe,stroke:#3b82f6

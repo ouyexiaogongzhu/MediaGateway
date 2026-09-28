@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import time
 
 import httpx
 from fastapi import APIRouter
@@ -54,6 +56,40 @@ _PROVIDERS = [
 
 # 供應商側模型名重寫（影策 key → 上游 omlx 目錄 id）
 _MODEL_REWRITE = {"qwen3.8-uncensored": "pyros-vault_Qwen3.8-27B-Uncensored-oQ4e-mtp"}
+
+# omlx 按需供應商：pyros-vault oQ4e-mtp 只在此服務（mtplx 對該量化輸出亂碼）
+OMLX_BASE = "http://127.0.0.1:8082"
+
+
+def _omlx_up() -> bool:
+    """裸 socket 探活——urllib 會吃 macOS 系統代理配置，localhost 也可能被劫持。"""
+    import socket
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        return s.connect_ex(("127.0.0.1", 8082)) == 0
+    finally:
+        s.close()
+
+
+def _ensure_omlx():
+    """omlx :8082 按需拉起：探活成功即返回；失敗才 spawn 並等就緒。
+    ponytail: 無 idle-exit——omlX 載入模型後常駐約 16GB（omlx memory-guard
+    自動卸載閒置模型），與 video 互斥場景若 OOM，加 tts 式 watchdog 即可。"""
+    if _omlx_up():
+        return
+    subprocess.Popen(
+        ["/opt/homebrew/opt/omlx/bin/omlx", "serve",
+         "--model-dir", "/Users/vincent/tool/qwen/models",
+         "--port", "8082", "--memory-guard", "safe"],
+        stdout=open("/tmp/omlx_8082.log", "a"), stderr=subprocess.STDOUT,
+        start_new_session=True)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        if _omlx_up():
+            return
+        time.sleep(2)
+    raise RuntimeError("omlx :8082 未能在 300s 內就緒 (log: /tmp/omlx_8082.log)")
 
 
 def _local_key(model) -> str:
@@ -129,6 +165,8 @@ def chat_completions(req: ChatRequest):
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         m = body.get("model") or ""
         body["model"] = _MODEL_REWRITE.get(m.lower(), m)  # 路由大小寫不敏感，重寫也必須是
+        if base == OMLX_BASE:
+            _ensure_omlx()  # 按需：探活失敗才 spawn（19GB 進程不常駐）
         if req.stream:
             # 供應商（grok2api/chatgpt2api）支持 SSE：逐塊透傳。
             # 上游中途出錯時 HTTP 已是 200，錯誤 JSON 會以原文出現在流裡，由前端解析。
