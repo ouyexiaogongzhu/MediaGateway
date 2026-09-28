@@ -7,13 +7,15 @@
 
 | 引擎 | 峰值内存（实测） | 并行结论 |
 |---|---|---|
-| iris.c (flux-klein-9b，唯一档) | ~11GB RSS | 可与 cosyvoice 并行 |
-| cosyvoice 0.5B | 8.7GB RSS | 可与 iris 并行 |
 | h3.c (MiniMax-H3) | MEM_GB=35 独占调度 | 单独跑，其余排队 |
-| qwen3.8-27b (TEXT) | 19.3GB RSS=MEM_GB | 与 video 互斥（_admit_next 卸载） |
+| **qwen_image**（Qwen-Image-2.1 7B，sd.cpp GGUF Q4_K） | ~10GB（worker MEM_GB） | 生圖主引擎（2026-09-28 投產） |
+| qwen3.8-27b (TEXT, mtplx :8000) | 19.3GB RSS=MEM_GB | 与 video 互斥（_admit_next 卸载） |
+| qwen3.8-uncensored (TEXT, omlx :8082) | ~19GB（未实测，外部守護進程不佔 MEM_GB） | oQ4e-mtp 量化與 mtplx 不兼容（亂碼），必須走 omlx |
 | flashvsr / ffmpeg | 低 | 随插随跑 |
+| ~~iris.c~~ | — | **已停用**：flux-klein-9b 模型目錄失蹤（2026-09-27 發現），route 被 qwen_image 頂替；重下 ~30GB 後可恢復 |
+| cosyvoice 0.5B | 8.7GB RSS | 可与 iris 并行 |
 
-## 1. iris.c — Image Engine
+## 1. iris.c — Image Engine（⚠ 已停用：模型目錄失蹤，生圖由 §7 Qwen-Image-2.1 頂替）
 
 - 位置：`~/tool/iris.c`，二进制 `./iris`，另有 `libiris.dylib`（后续可 ctypes，同 h3 模式）
 - 权重：`flux-klein-4b/` 15G（主力）、`zimage-turbo/` 31G（备用）
@@ -107,3 +109,11 @@ cd ~/tool/iris.c
   (实测:冰法师白蓝长裙不再漂成裤子);无害提示词余弦 0.97,一般能力无损
 - 原理:审查在文字编码器(概念 embedding 打折),DiT 无拒绝回路;ablation 移除拒绝方向
 - 回滚:`rm -rf text_encoder && mv text_encoder.orig text_encoder`
+
+## 8. Qwen-Image-2.1 — Image Engine（2026-09-28 投產）
+
+- `server/workers/qwen_image.py` → sd.cpp Metal（`~/tool/sd.cpp`，build/bin/sd-cli）
+- 權重：diffusion Q4_K GGUF 4.2GB + VAE bf16 675MB + Qwen3-VL-8B Q4_K_M 文本編碼器 5GB（尺寸+sha256 已校驗）
+- 實測：512²@20步 牆鐘 ~1.5 分（mmap 權重秒載）；中文文本渲染強項
+- `POST /v1/images/generations`：model 含 `qwen` 即路由；尺寸 32 倍數 ≤1536
+- ⚠ HF 大文件 `curl -C -` 續傳經代理會重疊追加損壞——原子下載（.part+尺寸校驗+mv），腳本 `models/dl2.py`
