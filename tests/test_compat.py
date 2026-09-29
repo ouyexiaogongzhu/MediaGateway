@@ -333,6 +333,17 @@ def test_aux_annotate(client):
         assert struct.unpack(">II", out[16:24]) == (128, 128), t
 
 
+def test_wait_ceiling_outlasts_image_worker(_c=None):
+    # A 504 while the worker still runs orphans it, and drops the temp dir whose
+    # ref PNGs the queued jobs still have to read (they then die instantly on
+    # "load image ... failed"). The HTTP wait must never undercut the worker.
+    from server import compat_openai
+    from server.workers import qwen_image
+
+    assert compat_openai._WAIT_TIMEOUT > qwen_image.DEFAULT_TIMEOUT, (
+        f"wait {compat_openai._WAIT_TIMEOUT}s <= worker {qwen_image.DEFAULT_TIMEOUT}s")
+
+
 if __name__ == "__main__":
     video._get_engine = lambda: FakeEngine()  # inject fake; scheduler runs it for real
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

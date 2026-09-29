@@ -32,7 +32,12 @@ from . import core
 
 router = APIRouter()
 
-_WAIT_TIMEOUT = 900
+# Must outlast the worker's own deadline (qwen_image.DEFAULT_TIMEOUT = 1800).
+# A 504 here abandons a job the worker is still running, and for images it drops
+# the temp dir whose ref PNGs the still-queued jobs have to read — so they fail
+# instantly on "load image ... failed" instead of doing their own work.
+# ponytail: duplicated constant; bump it with the worker timeout if that changes.
+_WAIT_TIMEOUT = 1800 + 120
 
 
 def _ssrf_check(url: str) -> None:
