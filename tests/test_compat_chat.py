@@ -120,6 +120,20 @@ def test_mutex_blocks_video_while_llm_resident():
         del sys.modules["server.llm"]
 
 
+def test_mutex_blocks_qwen_image_while_llm_resident():
+    # sd.cpp (Metal) + a resident 27B chat model exhausts 48GB unified memory;
+    # the kernel kills sd-cli (exited -15/-9). 16+10=26GB fits the budget, so
+    # only the mutex can block this — which is the point.
+    queue_job("qwen_image")
+    stub = make_llm_stub(resident=True)
+    sys.modules["server.llm"] = stub
+    try:
+        assert core._admit_next() is None          # image skipped this round
+        assert stub.calls == ["unload"]            # ...and unload requested
+    finally:
+        del sys.modules["server.llm"]
+
+
 def test_mutex_releases_once_llm_gone():
     queue_job("video")
     sys.modules["server.llm"] = make_llm_stub(resident=False)
@@ -276,6 +290,7 @@ def test_serving_probe_matches_variant():
 
 if __name__ == "__main__":
     tests = [test_mutex_blocks_video_while_llm_resident,
+             test_mutex_blocks_qwen_image_while_llm_resident,
              test_mutex_releases_once_llm_gone,
              test_llm_memory_counts_against_budget,
              test_no_llm_module_behaviour_unchanged,

@@ -222,11 +222,14 @@ def _admit_next() -> tuple[str, dict] | None:
             _update(row["id"], status="failed", error=f"unknown type: {row['type']}",
                     finished_at=time.time())
             continue
-        # GPU mutual exclusion: video/shot can't share 48GB with resident
-        # engines (LLM 19GB, TTS 8.7GB). Ask them to unload, skip this round;
-        # the next poll re-checks until the processes are gone. Absent module
-        # => behaviour unchanged.
-        if row["type"] in ("video", "shot"):
+        # GPU mutual exclusion: video/shot/qwen_image can't share 48GB with
+        # resident engines (LLM 19GB, TTS 8.7GB). Ask them to unload, skip this
+        # round; the next poll re-checks until the processes are gone. Absent
+        # module => behaviour unchanged.
+        # qwen_image was missing: sd.cpp (7B DiT + 8B Qwen3-VL, Metal) coexisting
+        # with a resident 27B chat model exhausted unified memory and the kernel
+        # killed sd-cli (exited -15/-9) before it finished the vision encode.
+        if row["type"] in ("video", "shot", "qwen_image"):
             blocked = False
             for mod_name in (_LLM_MODULE, "server.compat_chat", "server.workers.voice"):
                 mod = sys.modules.get(mod_name)
