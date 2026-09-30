@@ -73,6 +73,9 @@ def _cli_cmd(prompt: str, out: Path, width: int, height: int,
             cmd += ["-r", str(r)]
         if not unc:
             cmd += ["--llm_vision", str(b / "models/text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf")]
+        # 多 ref 的視覺 KV 是峰值 RSS 大頭（25GB/8ref）。8-bit 前綴快取省一半，
+        # 換取 swap 壓力消失；KV 量化對畫質影響遠小於 swap 拖慢（docs/qwen_image_2.1.md）
+        cmd += ["--model-args", "qwen_image_2_1_prefix_cache_type=q8_0"]
     if TURBO and not unc:
         cmd += ["--scheduler", "discrete"]
     if DBCACHE:
