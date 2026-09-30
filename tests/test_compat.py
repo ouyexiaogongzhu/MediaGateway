@@ -344,6 +344,43 @@ def test_wait_ceiling_outlasts_image_worker(_c=None):
         f"wait {compat_openai._WAIT_TIMEOUT}s <= worker {qwen_image.DEFAULT_TIMEOUT}s")
 
 
+def test_image_upscale_routing(_c=None):
+    # 普通行精修走 turbo 4 步；NSFW 必須 UC base（官方/turbo 會穿衣）+ 12 步；
+    # 参数可覆盖步数。UltraSharp 挂在生图管线上，输出经 --upscale-model。
+    import tempfile
+
+    from server.workers import image_upscale
+
+    captured = {}
+
+    def fake_run_cli(cmd, **_kw):
+        captured["cmd"] = cmd
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"PNG")
+
+    orig = image_upscale.run_cli
+    image_upscale.run_cli = fake_run_cli
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.png"
+            src.write_bytes(b"PNG")
+            image_upscale.run({"image_path": str(src), "width": 1728, "height": 960},
+                              Path(tmp), lambda *a: None, lambda: False)
+            cmd = captured["cmd"]
+            assert "qwen_image_2.1_turbo_Q4_K_M.gguf" in " ".join(cmd)
+            assert cmd[cmd.index("--steps") + 1] == "4"
+            assert "--llm_vision" not in cmd or "heretic" not in cmd[cmd.index("--llm_vision") + 1]
+
+            image_upscale.run({"image_path": str(src), "width": 1728, "height": 960,
+                               "uncensored": True, "steps": 4},
+                              Path(tmp), lambda *a: None, lambda: False)
+            cmd = captured["cmd"]
+            assert "qwen-image-2.1-UC-Q4_K_M.gguf" in " ".join(cmd)
+            assert "heretic" in " ".join(cmd)
+            assert cmd[cmd.index("--steps") + 1] == "4", "explicit steps must override"
+    finally:
+        image_upscale.run_cli = orig
+
+
 def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
     # 9-10 refs ballooned sd-cli to ~22GB on 48GB unified memory and stalled at
     # 0.3% CPU forever — same death spiral as 1024x1024, trigger axis = ref count.

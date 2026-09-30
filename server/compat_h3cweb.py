@@ -503,6 +503,22 @@ async def create_upscale(request: Request):
                 f.write(await up.read())
     else:
         raw = await request.json()
+        # 图片超分分支：image_path(+width/height+uncensored) → UltraSharp+精修
+        if raw.get("image_path"):
+            params = {"image_path": str(raw["image_path"]),
+                      "width": int(raw.get("width") or 0),
+                      "height": int(raw.get("height") or 0),
+                      "uncensored": bool(raw.get("uncensored"))}
+            if raw.get("strength"):
+                params["strength"] = float(raw["strength"])
+            if raw.get("steps"):
+                params["steps"] = int(raw["steps"])
+            if raw.get("timeout"):
+                params["timeout"] = _timeout(raw.get("timeout"))
+            if not params["width"] or not params["height"]:
+                raise HTTPException(400, "width and height are required for image upscale")
+            resp = core.create_job("image_upscale", params)
+            return {"id": resp["id"], "job_id": resp["id"], "status": resp["status"]}
         video_path = raw.get("video_path")
         resolution = str(raw.get("resolution") or resolution)
         model = str(raw.get("model") or model)
