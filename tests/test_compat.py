@@ -377,11 +377,14 @@ def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
 
 def test_qwen_image_turbo_config(_c=None):
     # turbo 融合档（仅官方 base）：4 步 / cfg1 / scheduler discrete（实测优于 simple）；
-    # uncensored 不走 turbo（UC 底模叠蒸馏 LoRA 实测烧图），提速走 DBCACHE
+    # uncensored 不走 turbo（UC 底模叠蒸馏 LoRA 实测烧图），提速走 DBCACHE；
+    # unc 优先级 = 任务参数（compat 按模型名分流）> env 全局
     import os
+    import tempfile
 
     from server.workers import qwen_image
 
+    captured = {}
     orig_turbo, orig_db, orig_unc = (qwen_image.TURBO, qwen_image.DBCACHE,
                                      os.environ.get("QWEN_IMAGE_UNCENSORED"))
     qwen_image.TURBO, qwen_image.DBCACHE = True, False
@@ -397,9 +400,31 @@ def test_qwen_image_turbo_config(_c=None):
         assert cmd[cmd.index("--steps") + 1] == "12", "unc must not take turbo recipe"
         assert "--scheduler" not in cmd
 
+        # 任务级参数覆盖 env：env 开着 unc，任务显式要 turbo 路径（uncensored=False）
+        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1, unc=False)
+        assert cmd[cmd.index("--steps") + 1] == "4"
+
         qwen_image.DBCACHE = True
         cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1)
         assert cmd[cmd.index("--cache-mode") + 1] == "dbcache"
+
+        # run() 全链：params.uncensored=True 时即使 TURBO 开着也走 UC 12 步
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_run_cli(c, **_kw):
+                captured["cmd"] = c
+                Path(c[c.index("-o") + 1]).write_bytes(b"PNG")
+
+            orig_cli = qwen_image.run_cli
+            qwen_image.run_cli = fake_run_cli
+            try:
+                qwen_image.run({"prompt": "x", "width": 864, "height": 480,
+                                "uncensored": True},
+                               Path(tmp), lambda *a: None, lambda: False)
+            finally:
+                qwen_image.run_cli = orig_cli
+        os.environ.pop("QWEN_IMAGE_UNCENSORED", None)
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--steps") + 1] == "12", "params.uncensored must force UC path"
     finally:
         qwen_image.TURBO, qwen_image.DBCACHE = orig_turbo, orig_db
         if orig_unc is None:

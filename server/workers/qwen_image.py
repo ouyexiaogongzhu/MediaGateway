@@ -48,10 +48,11 @@ def _round32(v: int) -> int:
 
 
 def _cli_cmd(prompt: str, out: Path, width: int, height: int,
-             steps: int, cfg: float, seed: int, refs=()) -> list[str]:
+             steps: int, cfg: float, seed: int, refs=(), unc: bool | None = None) -> list[str]:
     b = Path(DEFAULT_HOME)
-    # QWEN_IMAGE_UNCENSORED=1 → abenzerps UC 擴散 + pottokao Heretic 文本編碼器（去審查檔）
-    unc = os.environ.get("QWEN_IMAGE_UNCENSORED") == "1"
+    # unc：UC 去審查檔。優先級 = 任務參數（compat 按模型名分流）> env 全局開關
+    if unc is None:
+        unc = os.environ.get("QWEN_IMAGE_UNCENSORED") == "1"
     if TURBO and not unc:
         # 融合 turbo 檔：官方 base 專用（UC 底模疊蒸餾 LoRA 會燒圖，不走此徑）
         diff, steps, cfg = TURBO_DIFF, 4, 1.0
@@ -103,7 +104,8 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     # 需要成片品質的呼叫端自己傳 steps=20。
     steps = number(params, "steps", 12, 1, 150, int)
     cfg = number(params, "cfg_scale", 6.0, 0.0, 30.0, float)
-    if TURBO and os.environ.get("QWEN_IMAGE_UNCENSORED") != "1":
+    unc = bool(params.get("uncensored")) or os.environ.get("QWEN_IMAGE_UNCENSORED") == "1"
+    if TURBO and not unc:
         steps, cfg = 4, 1.0  # 與 _cli_cmd 的 turbo 配方同步，result 元數據才不說謊
     seed = seed_of(params, int.from_bytes(os.urandom(4), "little"))
     timeout = number(params, "timeout", DEFAULT_TIMEOUT, 1.0, 4 * 3600.0, float)
@@ -116,7 +118,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         refs = refs[:cap]
     progress(0.05, "generating")
     with _run_lock:
-        run_cli(_cli_cmd(prompt, out, width, height, steps, cfg, seed, refs),
+        run_cli(_cli_cmd(prompt, out, width, height, steps, cfg, seed, refs, unc=unc),
                 cwd=DEFAULT_HOME, log_path=job_dir / "qwen_image.log",
                 env=None,  # inherit environ
                 timeout=timeout, cancel=cancel, engine="qwen_image")

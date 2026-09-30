@@ -151,8 +151,12 @@ async def images_generations(req: ImageGenIn):
     # （必須匹配 qwen-image 而非 qwen，否則 qwen3.8-27b 等 CHAT 模型名會被吞進生圖）
     if req.model and "qwen-image" in req.model.lower():
         data = []
+        mlow = req.model.lower()
+        unc = "uncensored" in mlow or "nsfw" in mlow
         for i in range(n):
             params = {"prompt": req.prompt, "width": width, "height": height}
+            if unc:
+                params["uncensored"] = True
             if req.seed is not None:
                 params["seed"] = req.seed + i
             job = await _wait_job(core.create_job("qwen_image", params)["id"])
@@ -300,6 +304,10 @@ async def images_edits(request: Request):
         try:
             refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
             params = {"prompt": prompt, "width": width, "height": height, "refs": refs}
+            # 模型名带 uncensored/nsfw → UC 去审查档（官方 base/turbo 都会穿衣）
+            mlow = model.lower()
+            if "uncensored" in mlow or "nsfw" in mlow:
+                params["uncensored"] = True
             if seed is not None:
                 params["seed"] = seed
             job = await _wait_job(core.create_job("qwen_image", params)["id"])
