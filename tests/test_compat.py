@@ -370,7 +370,9 @@ def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
     cmd = captured["cmd"]
     passed = [cmd[i + 1] for i, v in enumerate(cmd) if v == "-r"]
     assert len(passed) == qwen_image.MAX_REFS, f"expected {qwen_image.MAX_REFS} refs, got {len(passed)}"
-    assert cmd[cmd.index("-s") + 1] == "12"
+    # sd.cpp 的 -s 是 --seed 缩写；steps 必须走长旗标，否则步数永远是默认 20
+    assert cmd[cmd.index("--steps") + 1] == "12"
+    assert "-s" not in cmd, "-s would set the seed, not steps"
 
 
 if __name__ == "__main__":

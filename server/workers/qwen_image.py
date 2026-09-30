@@ -62,7 +62,9 @@ def _cli_cmd(prompt: str, out: Path, width: int, height: int,
     cmd += [
         "-p", prompt,
         "-W", str(width), "-H", str(height),
-        "-s", str(steps), "--cfg-scale", str(cfg),
+        # 注意：sd.cpp 的 -s 是 --seed 的缩写，steps 只有长旗标——用 -s 传步数
+        # 实际改的是 seed（随后还被 --seed 覆盖），步数永远是默认 20。
+        "--steps", str(steps), "--cfg-scale", str(cfg),
         "--sampling-method", "euler", "--offload-to-cpu", "--fa",
         "--seed", str(seed),
         "-o", str(out),
