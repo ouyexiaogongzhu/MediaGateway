@@ -64,7 +64,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     if DBCACHE:
         cmd += ["--cache-mode", "dbcache", "--cache-option", "threshold=0.25,warmup=4"]
     progress(0.05, "upscaling")
-    run_cli(cmd, cwd=SDCPP_HOME, log_path=job_dir / "upscale.log",
+    run_cli(cmd, cwd=SDCPP_HOME, log_path=job_dir / "upscale.log", env=None,
             timeout=timeout, cancel=cancel, engine="image_upscale")
     progress(0.95, "saving")
     out = job_dir / "image.png"
