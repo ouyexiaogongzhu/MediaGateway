@@ -13,7 +13,11 @@ from pathlib import Path
 from ._util import number, run_cli, seed_of
 
 TYPE = "qwen_image"
-MEM_GB = 10.0
+# 实测 sd-cli 峰值 RSS 22-27GB（8 refs 编辑上下文），不是 10——按 10 算账时
+# BUDGET_GB=40 会一次放行 3 个 job，全部堵在 _run_lock 上，started_at 又在拿到
+# 锁之前写入，锁等待全被记成工时（影策外层超时照跳，「超预算 4 倍」假象）。
+# 同一笔错账也曾放 3 个 sd-cli 同时进 48GB → 记忆体死锁。26 保证同时只跑一个。
+MEM_GB = 26.0
 
 DEFAULT_HOME = os.environ.get("SDCPP_HOME", "/Users/vincent/tool/sd.cpp")
 DEFAULT_TIMEOUT = 1800.0
