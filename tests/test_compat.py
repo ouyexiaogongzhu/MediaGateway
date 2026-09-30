@@ -375,6 +375,56 @@ def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
     assert "-s" not in cmd, "-s would set the seed, not steps"
 
 
+def test_qwen_image_turbo_config(_c=None):
+    # turbo 融合档：官方配方 4 步 / cfg1 / scheduler simple；uncensored：UC base +
+    # 蒸馏 LoRA + 6 步官方 sigma 表；refs 裁到 3（turbo 训练分布）
+    import os
+    import tempfile
+
+    from server.workers import qwen_image
+
+    captured = {}
+    orig_turbo, orig_unc = qwen_image.TURBO, os.environ.get("QWEN_IMAGE_UNCENSORED")
+    qwen_image.TURBO = True
+    try:
+        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1)
+        assert cmd[cmd.index("--steps") + 1] == "4"
+        assert cmd[cmd.index("--cfg-scale") + 1] == "1.0"
+        assert cmd[cmd.index("--scheduler") + 1] == "simple"
+        assert "--lora-model-dir" not in cmd and "--sigmas" not in cmd
+
+        os.environ["QWEN_IMAGE_UNCENSORED"] = "1"
+        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1)
+        assert cmd[cmd.index("--steps") + 1] == "6"
+        assert cmd[cmd.index("--sigmas") + 1] == qwen_image.TURBO_SIGMAS
+        assert cmd[cmd.index("--lora-model-dir") + 1].endswith("/models")
+        assert "viggle_turbo_v021_r256:1.0" in cmd[cmd.index("-p") + 1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            captured.clear()
+
+            def fake_run_cli(c, **_kw):
+                captured["cmd"] = c
+                Path(c[c.index("-o") + 1]).write_bytes(b"PNG")
+
+            orig_cli = qwen_image.run_cli
+            qwen_image.run_cli = fake_run_cli
+            try:
+                qwen_image.run({"prompt": "x", "width": 864, "height": 480,
+                                "refs": [f"/tmp/r{i}.png" for i in range(8)]},
+                               Path(tmp), lambda *a: None, lambda: False)
+            finally:
+                qwen_image.run_cli = orig_cli
+        passed = [captured["cmd"][i + 1] for i, v in enumerate(captured["cmd"]) if v == "-r"]
+        assert len(passed) == 3, f"turbo must cap refs at 3, got {len(passed)}"
+    finally:
+        qwen_image.TURBO = orig_turbo
+        if orig_unc is None:
+            os.environ.pop("QWEN_IMAGE_UNCENSORED", None)
+        else:
+            os.environ["QWEN_IMAGE_UNCENSORED"] = orig_unc
+
+
 if __name__ == "__main__":
     video._get_engine = lambda: FakeEngine()  # inject fake; scheduler runs it for real
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
