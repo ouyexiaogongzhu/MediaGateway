@@ -23,13 +23,14 @@ DEFAULT_HOME = os.environ.get("SDCPP_HOME", "/Users/vincent/tool/sd.cpp")
 DEFAULT_TIMEOUT = 1800.0
 
 # Viggle Qwen-Image-2.1-viggle-turbo（DMD 蒸餾）：40 次模型評估 → 4 次，免 CFG。
-# QWEN_IMAGE_TURBO=1 啟用。融合檔走官方配方（4 步 / cfg1 / scheduler simple）；
-# uncensored 模式改為 UC base 疊 turbo LoRA（v0.2.1 6 步官方 sigma 表）。
+# QWEN_IMAGE_TURBO=1 啟用（乾淨實測 48s/張 vs base 12 步 132s，畫質難分）。
+# scheduler 實測 discrete 優於官方 README 建議的 simple（35.5s vs 41.4s，畫質同級）。
+# ⚠️ 僅用於官方 base——UC 去審查底模疊 turbo LoRA 實測燒圖（綠灰噪塊），已移除；
+# uncensored 提速走 QWEN_IMAGE_DBCACHE=1（dbcache 塊級快取 1.4×，畫質無損）。
 # turbo 按 1-3 張參考圖訓練，REF_CAP 同步裁到 3。
 TURBO = os.environ.get("QWEN_IMAGE_TURBO") == "1"
+DBCACHE = os.environ.get("QWEN_IMAGE_DBCACHE") == "1"
 TURBO_DIFF = "models/diffusion_models/qwen_image_2.1_turbo_Q4_K_M.gguf"
-TURBO_LORA = "viggle_turbo_v021_r256"
-TURBO_SIGMAS = "1.0,0.9375,0.875,0.75,0.5,0.25"
 
 # 每張參考圖的視覺編碼常駐統一記憶體。實測 M5 Pro 48GB：864x480 + 8 refs 完成
 # （579s），9-10 refs 時 RSS 衝上 ~22GB、swap 打滿、進程 0.3% CPU 停滯永不返回
@@ -51,10 +52,9 @@ def _cli_cmd(prompt: str, out: Path, width: int, height: int,
     b = Path(DEFAULT_HOME)
     # QWEN_IMAGE_UNCENSORED=1 → abenzerps UC 擴散 + pottokao Heretic 文本編碼器（去審查檔）
     unc = os.environ.get("QWEN_IMAGE_UNCENSORED") == "1"
-    if TURBO:
-        # 融合 turbo 檔打官方 base 配方；uncensored 則 UC base + 蒸餾 LoRA（6 步官方 sigma）
-        diff = f"models/diffusion_models/{TURBO_DIFF.split('/')[-1]}" if not unc else "models/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf"
-        steps, cfg = (4, 1.0) if not unc else (6, 1.0)
+    if TURBO and not unc:
+        # 融合 turbo 檔：官方 base 專用（UC 底模疊蒸餾 LoRA 會燒圖，不走此徑）
+        diff, steps, cfg = TURBO_DIFF, 4, 1.0
     else:
         diff = ("models/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf" if unc
                 else "models/diffusion_models/qwen_image_2.1-Q4_K.gguf")
@@ -73,12 +73,10 @@ def _cli_cmd(prompt: str, out: Path, width: int, height: int,
             cmd += ["-r", str(r)]
         if not unc:
             cmd += ["--llm_vision", str(b / "models/text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf")]
-    if TURBO and unc:
-        prompt = f"{prompt}<lora:{TURBO_LORA}:1.0>"
-        cmd += ["--lora-model-dir", str(b / "models"),
-                "--sigmas", TURBO_SIGMAS]
     if TURBO and not unc:
-        cmd += ["--scheduler", "simple"]
+        cmd += ["--scheduler", "discrete"]
+    if DBCACHE:
+        cmd += ["--cache-mode", "dbcache", "--cache-option", "threshold=0.25,warmup=4"]
     cmd += [
         "-p", prompt,
         "-W", str(width), "-H", str(height),
@@ -102,9 +100,8 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     # 需要成片品質的呼叫端自己傳 steps=20。
     steps = number(params, "steps", 12, 1, 150, int)
     cfg = number(params, "cfg_scale", 6.0, 0.0, 30.0, float)
-    if TURBO:  # 與 _cli_cmd 的 turbo 配方同步，result 元數據才不說謊
-        unc = os.environ.get("QWEN_IMAGE_UNCENSORED") == "1"
-        steps, cfg = (6, 1.0) if unc else (4, 1.0)
+    if TURBO and os.environ.get("QWEN_IMAGE_UNCENSORED") != "1":
+        steps, cfg = 4, 1.0  # 與 _cli_cmd 的 turbo 配方同步，result 元數據才不說謊
     seed = seed_of(params, int.from_bytes(os.urandom(4), "little"))
     timeout = number(params, "timeout", DEFAULT_TIMEOUT, 1.0, 4 * 3600.0, float)
 
