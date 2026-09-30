@@ -344,6 +344,35 @@ def test_wait_ceiling_outlasts_image_worker(_c=None):
         f"wait {compat_openai._WAIT_TIMEOUT}s <= worker {qwen_image.DEFAULT_TIMEOUT}s")
 
 
+def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
+    # 9-10 refs ballooned sd-cli to ~22GB on 48GB unified memory and stalled at
+    # 0.3% CPU forever — same death spiral as 1024x1024, trigger axis = ref count.
+    # The worker must trim refs to MAX_REFS and default to draft steps (12).
+    import tempfile
+
+    from server.workers import qwen_image
+
+    captured = {}
+
+    def fake_run_cli(cmd, **_kw):
+        captured["cmd"] = cmd
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"PNG")
+
+    orig = qwen_image.run_cli
+    qwen_image.run_cli = fake_run_cli
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            refs = [f"/tmp/ref_{i}.png" for i in range(10)]
+            qwen_image.run({"prompt": "x", "width": 864, "height": 480, "refs": refs},
+                           Path(tmp), lambda *a: None, lambda: False)
+    finally:
+        qwen_image.run_cli = orig
+    cmd = captured["cmd"]
+    passed = [cmd[i + 1] for i, v in enumerate(cmd) if v == "-r"]
+    assert len(passed) == qwen_image.MAX_REFS, f"expected {qwen_image.MAX_REFS} refs, got {len(passed)}"
+    assert cmd[cmd.index("-s") + 1] == "12"
+
+
 if __name__ == "__main__":
     video._get_engine = lambda: FakeEngine()  # inject fake; scheduler runs it for real
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
