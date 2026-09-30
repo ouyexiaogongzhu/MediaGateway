@@ -358,6 +358,8 @@ def test_image_upscale_routing(_c=None):
         Path(cmd[cmd.index("-o") + 1]).write_bytes(b"PNG")
 
     orig = image_upscale.run_cli
+    orig_turbo = image_upscale.TURBO
+    image_upscale.TURBO = True
     image_upscale.run_cli = fake_run_cli
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,6 +381,7 @@ def test_image_upscale_routing(_c=None):
             assert cmd[cmd.index("--steps") + 1] == "4", "explicit steps must override"
     finally:
         image_upscale.run_cli = orig
+        image_upscale.TURBO = orig_turbo
 
 
 def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
