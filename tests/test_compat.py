@@ -471,21 +471,22 @@ def test_engine_selection(_c=None):
             os.environ["QWEN_IMAGE_ENGINE"] = orig_eng
 
 
-def test_krea2_tae_and_no_refs(_c=None):
+def test_krea2_tae_and_refs(_c=None):
     # --tae(TAEHV) 是 Krea2 的 2 倍提速來源：wan VAE 真 decode 84s / 207s。
     # 少了它 Krea2 直接慢一半以上。Krea2 走 --diffusion-fa 不是 --fa，且不開 sigmas。
     from server.workers import qwen_image
 
     cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "krea2", 1)
     assert cmd[cmd.index("--tae") + 1].endswith("taew2_1.safetensors")
-    assert cmd[cmd.index("--steps") + 1] == "4"
+    assert cmd[cmd.index("--steps") + 1] == "8"
     assert cmd[cmd.index("--cfg-scale") + 1] == "1.0"
     assert "--diffusion-fa" in cmd and "--sigmas" not in cmd
     # Krea2 用 4B + wan VAE，不是 Qwen 系那套
     assert "Qwen3VL-4B" in " ".join(cmd) and "wan_2.1_vae" in " ".join(cmd)
 
-    # 要參考圖時退回 Viggle：Krea2 視覺塔未驗證，而 Viggle 對 NSFW 零降級
-    assert not qwen_image.ENGINES["krea2"]["refs"]
+    # Krea2 參考圖路徑 2026-10-02 實測通過（view/krea_r4bmmproj.png），
+    # 所以要 refs 時**留在 Krea2**，不再退回 Viggle。
+    assert qwen_image.ENGINES["krea2"]["refs"]
     import tempfile
 
     captured = {}
@@ -503,25 +504,51 @@ def test_krea2_tae_and_no_refs(_c=None):
                                  Path(tmp), lambda *a: None, lambda: False)
     finally:
         qwen_image.run_cli = orig
-    assert res["engine"] == "viggle", "refs must fall back to Viggle"
-    assert captured["cmd"][captured["cmd"].index("--steps") + 1] == "6"
+    assert res["engine"] == "krea2"
+    assert captured["cmd"][captured["cmd"].index("--steps") + 1] == "8"
+    # ⚠️ 視覺塔必須是 4B 那顆。配 8B 的會靜默失效（rc=0 但無視 -r，
+    #    llm.hpp:386 "vision projector output size ... does not match"）。
+    assert "mmproj-Qwen3VL-4B-Instruct-F16" in " ".join(captured["cmd"])
 
 
-def test_dbcache_threshold_is_tuned_for_short_schedules(_c=None):
-    # threshold=0.25 是舊的 20 步檔值，實測 0.2 就開始鬼影/重曝、0.25 跳 3/8 步必壞。
-    # warmup=4 更致命：4/6 步引擎上前 4 步強制計算 = 快取根本沒開。兩者都別回頭。
+def test_dbcache_is_opt_in_and_ghosts_at_512(_c=None):
+    # 生產預設 nocache。dbcache(th=0.1) 在 1024² 目檢乾淨，但在 512² 實測明顯鬼影：
+    # 左側半透明重複人形 + 主體周圍 2~3 張幽靈臉。短劇草稿檔就是 512x288/512²，
+    # 髒的剛好是產量最大那一級，省 9.1% 買不到。開回來：QWEN_IMAGE_DBCACHE=1。
     from server.workers import qwen_image
 
     assert qwen_image.DBCACHE_OPTION == "threshold=0.1", "ghosting/re-exposure bug"
     assert "warmup" not in qwen_image.DBCACHE_OPTION
     for eng in qwen_image.ENGINES:
         cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, eng, 1)
-        assert cmd[cmd.index("--cache-mode") + 1] == "dbcache"
-        assert cmd[cmd.index("--cache-option") + 1] == "threshold=0.1"
+        assert "--cache-mode" not in cmd, f"{eng} must not ship cache by default"
         # --offload-to-cpu 去掉反而慢，别動
         assert "--offload-to-cpu" in cmd
         # --mmap 統一記憶體下是負收益(+8%)，--eager-load 淨虧 4s，都不要加
         assert "--mmap" not in cmd and "--eager-load" not in cmd
+    # 門檻/warmup 那兩個坑是「萬一開回來」的前提，別趁改預設時一併放寬
+    orig = qwen_image.DBCACHE
+    qwen_image.DBCACHE = True
+    try:
+        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "viggle", 1)
+    finally:
+        qwen_image.DBCACHE = orig
+    assert cmd[cmd.index("--cache-mode") + 1] == "dbcache"
+    assert cmd[cmd.index("--cache-option") + 1] == "threshold=0.1"
+
+
+def test_plist_does_not_re_enable_dbcache(_c=None):
+    # 程式碼預設值在生產上是廢的——launchd 注入的 EnvironmentVariables 蓋掉它。
+    # QWEN_IMAGE_DBCACHE=1 就是生產裡偷偷開快取的那個開關，只翻程式碼不會生效。
+    import plistlib
+
+    path = Path(os.path.expanduser("~/Library/LaunchAgents/com.aifilm.gateway.plist"))
+    if not path.is_file():
+        return  # 沒裝 launchd 的機器（CI/容器）
+    env = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
+    assert env.get("QWEN_IMAGE_DBCACHE") != "1", "plist overrides code default → 512² ghosting"
+    # TURBO 分支已刪，這個 key 自 image_upscale 收成單一路徑起就沒人讀
+    assert "QWEN_IMAGE_TURBO" not in env, "dead setting, nothing reads it"
 
 
 def test_krea2_model_files_exist(_c=None):

@@ -53,7 +53,20 @@ REAL_FRAMES = 354
 
 
 class FakePopen:
-    """Mimics the Popen surface run_arm actually touches."""
+    """Mimics the Popen surface run_arm actually touches.
+
+    Only the ARM LAUNCH is faked. Everything else is delegated to the real Popen,
+    because subprocess.run() is implemented on top of Popen: stubbing Popen wholesale
+    also captures every ffprobe/ffmpeg the acceptance checks shell out to, and
+    count_frames() then silently returns None. That showed up as every arm VOIDing
+    FRAME_UNPROBED against a file that counts fine outside this harness -- a harness
+    artifact indistinguishable from a real defect. Intercept by command, not globally.
+    """
+    def __new__(cls, cmd, *a, **kw):
+        if not any("upscale_cli.py" in str(c) for c in cmd):
+            return REAL_POPEN(cmd, *a, **kw)
+        return super().__new__(cls)
+
     def __init__(self, cmd, cwd=None, env=None, stdout=None, stderr=None,
                  start_new_session=False):
         self.pid, self.returncode = 4242, None
@@ -117,8 +130,20 @@ def main():
         if len(reloaded) != len(results):
             fails.append(f"JSON has {len(reloaded)} arms, run had {len(results)}")
 
-    # restore the real subprocess so extract genuinely runs ffmpeg
+    # THE regression this whole check exists for, against the real 21MB production
+    # artifact: its log declared 357, it decodes 354. Before the frame check the bench
+    # ACCEPTED this. It must VOID now, and for this reason and no other.
     fb.subprocess.Popen = REAL_POPEN
+    reg = fb.OUT / "96723d6d_declared357.log"
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(fake_log(saved=str(REAL_MP4), declared=357))
+    rv = fb.check_arm(reg)
+    if rv["ok"]:
+        fails.append("96723d6d regression: declared 357 / decoded 354 was ACCEPTED")
+    elif not any("FRAME_COUNT" in s for s in rv["voids"]):
+        fails.append(f"96723d6d regression: voided for {rv['voids']}, want FRAME_COUNT")
+    else:
+        print(f"  [ok ] 96723d6d declared 357 -> {rv['voids'][0]}")
     print("\nframe extraction over the faked arms:")
     fb.extract(results)
     frames = list((fb.OUT / "frames").glob("*.png"))

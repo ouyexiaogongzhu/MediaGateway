@@ -35,16 +35,20 @@ def client():
 
 
 @pytest.fixture
-def url():
+def url(request):
     """Base URL of a live local HTTP server answering with the voice worker's stub.
 
     The stub class lives in the test module (it records payloads for assertions),
     so import it from whichever module asked for this fixture.
+    `request.node.module` replaces the removed `pytest.stack()` (pytest 8);
+    it's already the live module object, no sys.modules lookup needed.
+
+    场景取自 `request.node.name`：4xx → bad400、5xx → err500，其余 ok。
+    旧写法无条件重置成 ok，失败路径的测试因此永远走成功分支（报 expected RuntimeError）。
     """
-    import sys
-    mod = sys.modules[pytest.stack()[1].module]
-    stub = getattr(mod, "Stub")
-    stub.scenario = "ok"
+    stub = getattr(request.node.module, "Stub")
+    name = request.node.name
+    stub.scenario = "bad400" if "4xx" in name else "err500" if "5xx" in name else "ok"
     stub.hits = 0
     stub.last_payload = None
     srv = ThreadingHTTPServer(("127.0.0.1", 0), stub)

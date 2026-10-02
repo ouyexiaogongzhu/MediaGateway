@@ -19,3 +19,6 @@ __pycache__/
 /t2_full_9s.mp4
 /t2_out.avi
 /server/jobs.db
+
+# 測試期間由 sqlite 在 repo 根目錄產生的空檔（正式庫在 data/gateway.db）
+/gateway.db

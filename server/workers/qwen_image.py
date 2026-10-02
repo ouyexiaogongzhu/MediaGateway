@@ -3,8 +3,13 @@
 生產檔，2026-10-02 實測，M5 Pro 48GB，牆鐘（含模型載入）：
   Viggle v0.3 6 步 + dbcache   1024² 63s / 1024x576 38s / 512x288 17s
                               主力，中文文字最好、構圖全能
-  Krea2 v1.1 4 步 + --tae     1024² 61s（中文）/ 68s（多人）/ 63s（NSFW）
+                              ⚠️ 這三個數字是**帶 dbcache** 量到的。生產現已改 nocache
+                                 （512² 鬼影，見下面 DBCACHE），純 nocache 牆鐘未重測，
+                                 別把這列當現況往外報
+  Krea2 v1.1 8 步 + --tae     1024² 111s（中文）/ 111s（多人）/ 101s（NSFW）
                               第二引擎，西方寫實質感/直白構圖
+                              （4 步是蒸餾設計點，實測 61/68/63s；現依 2026-10-02
+                               決策走 8 步，代價 +60~82% 牆鐘）
   （舊的 qwen_image_2.1 base 20 步 cfg6 = 431s，已退役刪除）
 
 ⚠️ 512 以下再降解析度省不到時間：固定成本約 9s 主導（512² 15s vs 512x288 17s）。
@@ -58,17 +63,26 @@ ENGINES = {
         "vae": "models/vae/wan_2.1_vae.safetensors",
         "tae": "models/vae/taew2_1.safetensors",
         "llm": "models/text_encoders/Qwen3VL-4B-Instruct-Q4_K_M.gguf",
-        "steps": 4,
-        "refs": False,
+        # 8 步（非蒸餾設計點的 4 步）——2026-10-02 依實測目檢結論配置。
+        # 代價實測：cn 61→111s / multi 68→111s / nsfw 63→101s，即 +60~82% 牆鐘。
+        "steps": 8,
+        # ⚠️ 視覺塔必須是 4B 那顆。配 8B 的 mmproj 會**靜默失效**：llm.hpp:386 只印
+        #    ERROR 然後 vision disabled，sd-cli 照樣 rc=0 存檔，但圖完全無視 -r
+        #    （實測：臥床裸女輸入 → 穿紅衣棚拍，連審查降級一起發生）。
+        #    判準是 out_hidden_size 要等於 LLM hidden_size（4B=2560 / 8B=4096）。
+        "vision": "models/text_encoders/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
+        "refs": True,  # 2026-10-02 實測通過（view/krea_r4bmmproj.png：姿勢/床/窗/簾全對位）
     },
 }
 
-# dbcache 塊級快取。⚠️ threshold 從 0.25 改成 0.1 是修既有 bug，不是調參：
-# 實測 0.2 就開始出現鬼影/重曝，0.25 在 12-20 步上跳 3/8 步必壞。
-# 0.1 只跳 1 步、畫質無瑕、-19% 時間（Viggle 67.14s → 54.15s）。
-# warmup 留預設 0：舊值 warmup=4 是照 20 步檔定的，4/6 步引擎上會擋掉全部跳步
-# （前 N 步強制計算），快取等於沒開。
-DBCACHE = os.environ.get("QWEN_IMAGE_DBCACHE", "1") != "0"
+# dbcache 塊級快取，**生產預設關閉**（opt-in，要開用 QWEN_IMAGE_DBCACHE=1）。
+# 關的理由不是效能而是畫質：1024² benchmark 產物目檢乾淨，但 512² 實測明顯鬼影
+# ——左側半透明重複人形 + 主體周圍 2~3 張幽靈臉（docs/tools.md §11）。而短劇草稿檔
+# 正是 512x288/512²，髒的剛好是產量最大那一級。牆鐘只快 9.1%，買不到這個。
+# ⚠️ 真要開回來，門檻兩個坑別回頭：threshold 0.2 起鬼影/重曝、0.25 跳 3/8 步必壞，
+# 所以是 0.1；warmup 留預設 0——舊值 warmup=4 是照 20 步檔定的，4/6 步引擎上前
+# 4 步強制計算，快取等於沒開。
+DBCACHE = os.environ.get("QWEN_IMAGE_DBCACHE", "0") == "1"
 DBCACHE_OPTION = "threshold=0.1"  # image_upscale 共用同一條，避免兩處各抄一份改漏
 
 # 每張參考圖的視覺編碼常駐統一記憶體。實測 M5 Pro 48GB：864x480 + 8 refs 完成
@@ -154,10 +168,6 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     height = _round32(number(params, "height", 1024, 32, 4096, int))
     unc = bool(params.get("uncensored")) or os.environ.get("QWEN_IMAGE_UNCENSORED") == "1"
     engine = _pick_engine(params, unc)
-    # Krea2 沒有驗證過參考圖路徑（視覺塔不同）。要 refs 時退回 Viggle——實測 Viggle
-    # 對 NSFW 零降級，回退不會掉畫質；engine 照實寫進 result，日後要看誰走了哪條。
-    if params.get("refs") and not ENGINES[engine]["refs"]:
-        engine = "viggle"
     e = ENGINES[engine]
     seed = seed_of(params, int.from_bytes(os.urandom(4), "little"))
     timeout = number(params, "timeout", DEFAULT_TIMEOUT, 1.0, 4 * 3600.0, float)
