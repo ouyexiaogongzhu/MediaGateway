@@ -114,14 +114,17 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         width=width,
         height=height,
         # 默认走 WorkBuddy 62 链交付实证档（2026-09-07，768x1344 ≈2.5 分/镜）：
-        # steps 4 = klein 蒸馏原生；reuse2/core4 = 官方默认档，比 h3cweb 沿用的 1/1 快 ~4-5x
+        # steps 4 = klein 蒸馏原生；denoise_reuse 必须留 1（h3.c:574 拒绝 core_reuse>1 且 denoise_reuse>1）。
+        # core_reuse 缺省 1：4 虽 dispatch 减半且草稿画质不劣，但 544x960 实测画面被毁。
         steps=int(params.get("steps", profile.get("steps", 4))),
-        denoise_reuse=int(params.get("denoise_reuse", profile.get("denoise_reuse", 2))),
+        denoise_reuse=int(params.get("denoise_reuse", profile.get("denoise_reuse", 1))),
         dit_layers=int(params.get("dit_layers", profile.get("dit_layers", 45))),
     )
     # core_reuse/token_reduction/ssd_streaming mirror h3cweb: only send non-defaults.
     # 哨兵合并：显式键（含显式 false/0）优先于 profile
-    core = int(params["core_reuse"]) if "core_reuse" in params else int(profile.get("core_reuse", 4))
+    # 缺省=1（2026-10-02 T4 实测改）：4 在 288x512 更快，但在 544x960/f362
+    # 把画面毁成涂抹噪点——wait/frame 减半、端到端 -41%，却不能用于正片。
+    core = int(params["core_reuse"]) if "core_reuse" in params else int(profile.get("core_reuse", 1))
     if core > 1:
         overrides["core_reuse"] = core
     tok = params["token_reduction"] if "token_reduction" in params else profile.get("token_reduction")
@@ -152,6 +155,12 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         overrides["last_frame"] = _check_file("last_frame", params["last_frame"])
     if params.get("reference_image_size") is not None:
         overrides["reference_image_size"] = int(params["reference_image_size"])
+
+    if overrides.get("core_reuse", 1) > 1 and overrides.get("denoise_reuse", 1) > 1:
+        raise VideoError(
+            f"core_reuse={overrides['core_reuse']} cannot be combined with "
+            f"denoise_reuse={overrides['denoise_reuse']} (h3.c:574 rejects the pair); "
+            "set one of them to 1")
 
     refs = _build_refs(params.get("refs"))
     output_path = str(job_dir / "output.mp4")

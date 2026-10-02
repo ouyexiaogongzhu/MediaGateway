@@ -108,8 +108,8 @@ def test_defaults_and_param_mapping():
     eng = FakeEngine()
     _, calls = run_with({"prompt": "a cat"}, eng)
     ov = calls[0]["overrides"]
-    assert ov == {"width": 864, "height": 480, "steps": 4, "denoise_reuse": 2,
-                  "dit_layers": 45, "core_reuse": 4}, ov
+    assert ov == {"width": 864, "height": 480, "steps": 4, "denoise_reuse": 1,
+                  "dit_layers": 45}, ov  # core_reuse 缺省不发（=1）
     assert calls[0]["refs"] == []
     assert calls[0]["output_path"].endswith("output.mp4")
 
@@ -140,7 +140,8 @@ def test_optional_flags_passthrough():
     assert ov["ssd_streaming"] == 1 and ov["seed"] == 123
     assert ov["reference_image_size"] == 512
     _, calls = run_with({"prompt": "x"}, FakeEngine())
-    assert calls[0]["overrides"]["core_reuse"] == 4  # 默认档显式下发
+    # 缺省不发 core_reuse：4 在 544x960 实测毁画质（T4），默认走 1
+    assert "core_reuse" not in calls[0]["overrides"]
     assert "seed" not in calls[0]["overrides"]
     assert "token_reduction" not in calls[0]["overrides"]
 
