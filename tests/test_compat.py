@@ -345,8 +345,10 @@ def test_wait_ceiling_outlasts_image_worker(_c=None):
 
 
 def test_image_upscale_routing(_c=None):
-    # 普通行精修走 turbo 4 步；NSFW 必須 UC base（官方/turbo 會穿衣）+ 12 步；
-    # 参数可覆盖步数。UltraSharp 挂在生图管线上，输出经 --upscale-model。
+    # 單一 turbo 4 步路徑。實測推翻舊前提：strength 0.35 / 4 步對 NSFW 輸入
+    # 完整保留無衣狀態，所以 uncensored 不再分流到 UC base + heretic 視覺塔——
+    # params["uncensored"] 保留但忽略（不動 compat_openai 的介面合約）。
+    # UltraSharp 挂在生图管线上，输出经 --upscale-model。
     import tempfile
 
     from server.workers import image_upscale
@@ -358,8 +360,6 @@ def test_image_upscale_routing(_c=None):
         Path(cmd[cmd.index("-o") + 1]).write_bytes(b"PNG")
 
     orig = image_upscale.run_cli
-    orig_turbo = image_upscale.TURBO
-    image_upscale.TURBO = True
     image_upscale.run_cli = fake_run_cli
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,24 +370,29 @@ def test_image_upscale_routing(_c=None):
             cmd = captured["cmd"]
             assert "qwen_image_2.1_turbo_Q4_K_M.gguf" in " ".join(cmd)
             assert cmd[cmd.index("--steps") + 1] == "4"
-            assert "--llm_vision" not in cmd or "heretic" not in cmd[cmd.index("--llm_vision") + 1]
+            assert cmd[cmd.index("--strength") + 1] == "0.35"
 
+            # uncensored 必須被忽略：同一條 turbo 路徑，不換底模、不掛 heretic 視覺塔
             image_upscale.run({"image_path": str(src), "width": 1728, "height": 960,
                                "uncensored": True, "steps": 4},
                               Path(tmp), lambda *a: None, lambda: False)
             cmd = captured["cmd"]
-            assert "qwen-image-2.1-UC-Q4_K_M.gguf" in " ".join(cmd)
-            assert "heretic" in " ".join(cmd)
+            joined = " ".join(cmd)
+            assert "qwen_image_2.1_turbo_Q4_K_M.gguf" in joined, "unc must not change model"
+            assert "UC-Q4_K_M" not in joined and "heretic" not in joined
+            assert "--llm_vision" not in cmd
             assert cmd[cmd.index("--steps") + 1] == "4", "explicit steps must override"
+
+            # 已刪除的檔不能再出現在任何一條路徑上
+            assert "qwen_image_2.1-Q4_K.gguf" not in joined
     finally:
         image_upscale.run_cli = orig
-        image_upscale.TURBO = orig_turbo
 
 
-def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
+def test_qwen_image_refs_trimmed(_c=None):
     # 9-10 refs ballooned sd-cli to ~22GB on 48GB unified memory and stalled at
     # 0.3% CPU forever — same death spiral as 1024x1024, trigger axis = ref count.
-    # The worker must trim refs to MAX_REFS and default to draft steps (12).
+    # The worker must trim refs to MAX_REFS.
     import tempfile
 
     from server.workers import qwen_image
@@ -411,66 +416,127 @@ def test_qwen_image_refs_trimmed_and_draft_steps(_c=None):
     passed = [cmd[i + 1] for i, v in enumerate(cmd) if v == "-r"]
     assert len(passed) == qwen_image.MAX_REFS, f"expected {qwen_image.MAX_REFS} refs, got {len(passed)}"
     # sd.cpp 的 -s 是 --seed 缩写；steps 必须走长旗标，否则步数永远是默认 20
-    assert cmd[cmd.index("--steps") + 1] == "12"
     assert "-s" not in cmd, "-s would set the seed, not steps"
 
 
-def test_qwen_image_turbo_config(_c=None):
-    # turbo 融合档（仅官方 base）：4 步 / cfg1 / scheduler discrete（实测优于 simple）；
-    # uncensored 不走 turbo（UC 底模叠蒸馏 LoRA 实测烧图），提速走 DBCACHE；
-    # unc 优先级 = 任务参数（compat 按模型名分流）> env 全局
+def test_viggle_sigma_count_is_steps_plus_one(_c=None):
+    # 最貴的坑：HF model card 給 6 個 sigma，那是 diffusers 格式。sd.cpp 要 steps+1 個、
+    # 尾巴補 0——只給 6 個會產出整片鹽胡椒噪點，不是「畫質差」而已。
+    from server.workers import qwen_image
+
+    cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "viggle", 1)
+    steps = int(cmd[cmd.index("--steps") + 1])
+    sigmas = cmd[cmd.index("--sigmas") + 1].split(",")
+    assert len(sigmas) == steps + 1, f"{steps} steps needs {steps + 1} sigmas, got {len(sigmas)}"
+    assert sigmas[-1] == "0", "last sigma must be 0"
+    assert cmd[cmd.index("--scheduler") + 1] == "discrete"
+
+
+def test_engine_selection(_c=None):
+    # unc 沿用舊語義當「走 Krea2」的快捷方式（viggle 對 NSFW 零降級，舊的
+    # 去審查底模前提已不成立）。優先級：任務 engine 參數 > env > unc 推導。
     import os
-    import tempfile
 
     from server.workers import qwen_image
 
-    captured = {}
-    orig_turbo, orig_db, orig_unc = (qwen_image.TURBO, qwen_image.DBCACHE,
-                                     os.environ.get("QWEN_IMAGE_UNCENSORED"))
-    qwen_image.TURBO, qwen_image.DBCACHE = True, False
+    def cmd_for(**params):
+        return qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024,
+                                   qwen_image._pick_engine(params, None), 1)
+
+    orig_unc = os.environ.pop("QWEN_IMAGE_UNCENSORED", None)
+    orig_eng = os.environ.pop("QWEN_IMAGE_ENGINE", None)
     try:
-        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1)
-        assert cmd[cmd.index("--steps") + 1] == "4"
-        assert cmd[cmd.index("--cfg-scale") + 1] == "1.0"
-        assert cmd[cmd.index("--scheduler") + 1] == "discrete"
-        assert "--lora-model-dir" not in cmd and "--sigmas" not in cmd
-
+        # 默认 = Viggle 主力
+        assert qwen_image._pick_engine({}, False) == "viggle"
+        # 向後相容：unc 參數 / QWEN_IMAGE_UNCENSORED 都要能走，不能讓呼叫端炸掉
+        assert qwen_image._pick_engine({"uncensored": True}, True) == "krea2"
         os.environ["QWEN_IMAGE_UNCENSORED"] = "1"
-        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1)
-        assert cmd[cmd.index("--steps") + 1] == "12", "unc must not take turbo recipe"
-        assert "--scheduler" not in cmd
-
-        # 任务级参数覆盖 env：env 开着 unc，任务显式要 turbo 路径（uncensored=False）
-        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1, unc=False)
-        assert cmd[cmd.index("--steps") + 1] == "4"
-
-        qwen_image.DBCACHE = True
-        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 864, 480, 12, 6.0, 1)
-        assert cmd[cmd.index("--cache-mode") + 1] == "dbcache"
-
-        # run() 全链：params.uncensored=True 时即使 TURBO 开着也走 UC 12 步
-        with tempfile.TemporaryDirectory() as tmp:
-            def fake_run_cli(c, **_kw):
-                captured["cmd"] = c
-                Path(c[c.index("-o") + 1]).write_bytes(b"PNG")
-
-            orig_cli = qwen_image.run_cli
-            qwen_image.run_cli = fake_run_cli
-            try:
-                qwen_image.run({"prompt": "x", "width": 864, "height": 480,
-                                "uncensored": True},
-                               Path(tmp), lambda *a: None, lambda: False)
-            finally:
-                qwen_image.run_cli = orig_cli
-        os.environ.pop("QWEN_IMAGE_UNCENSORED", None)
-        cmd = captured["cmd"]
-        assert cmd[cmd.index("--steps") + 1] == "12", "params.uncensored must force UC path"
-    finally:
-        qwen_image.TURBO, qwen_image.DBCACHE = orig_turbo, orig_db
-        if orig_unc is None:
-            os.environ.pop("QWEN_IMAGE_UNCENSORED", None)
+        assert qwen_image._pick_engine({}, None) == "krea2"
+        # 顯式指定優先於 env
+        assert qwen_image._pick_engine({"engine": "viggle"}, True) == "viggle"
+        os.environ["QWEN_IMAGE_ENGINE"] = "krea2"
+        assert qwen_image._pick_engine({}, False) == "krea2"
+        try:
+            qwen_image._pick_engine({"engine": "sdxl"}, False)
+        except ValueError:
+            pass
         else:
+            raise AssertionError("unknown engine must raise, not silently fall back")
+    finally:
+        for k in ("QWEN_IMAGE_UNCENSORED", "QWEN_IMAGE_ENGINE"):
+            os.environ.pop(k, None)
+        if orig_unc is not None:
             os.environ["QWEN_IMAGE_UNCENSORED"] = orig_unc
+        if orig_eng is not None:
+            os.environ["QWEN_IMAGE_ENGINE"] = orig_eng
+
+
+def test_krea2_tae_and_no_refs(_c=None):
+    # --tae(TAEHV) 是 Krea2 的 2 倍提速來源：wan VAE 真 decode 84s / 207s。
+    # 少了它 Krea2 直接慢一半以上。Krea2 走 --diffusion-fa 不是 --fa，且不開 sigmas。
+    from server.workers import qwen_image
+
+    cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "krea2", 1)
+    assert cmd[cmd.index("--tae") + 1].endswith("taew2_1.safetensors")
+    assert cmd[cmd.index("--steps") + 1] == "4"
+    assert cmd[cmd.index("--cfg-scale") + 1] == "1.0"
+    assert "--diffusion-fa" in cmd and "--sigmas" not in cmd
+    # Krea2 用 4B + wan VAE，不是 Qwen 系那套
+    assert "Qwen3VL-4B" in " ".join(cmd) and "wan_2.1_vae" in " ".join(cmd)
+
+    # 要參考圖時退回 Viggle：Krea2 視覺塔未驗證，而 Viggle 對 NSFW 零降級
+    assert not qwen_image.ENGINES["krea2"]["refs"]
+    import tempfile
+
+    captured = {}
+
+    def fake_run_cli(c, **_kw):
+        captured["cmd"] = c
+        Path(c[c.index("-o") + 1]).write_bytes(b"PNG")
+
+    orig = qwen_image.run_cli
+    qwen_image.run_cli = fake_run_cli
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            res = qwen_image.run({"prompt": "x", "width": 512, "height": 512,
+                                  "uncensored": True, "refs": ["/tmp/r.png"]},
+                                 Path(tmp), lambda *a: None, lambda: False)
+    finally:
+        qwen_image.run_cli = orig
+    assert res["engine"] == "viggle", "refs must fall back to Viggle"
+    assert captured["cmd"][captured["cmd"].index("--steps") + 1] == "6"
+
+
+def test_dbcache_threshold_is_tuned_for_short_schedules(_c=None):
+    # threshold=0.25 是舊的 20 步檔值，實測 0.2 就開始鬼影/重曝、0.25 跳 3/8 步必壞。
+    # warmup=4 更致命：4/6 步引擎上前 4 步強制計算 = 快取根本沒開。兩者都別回頭。
+    from server.workers import qwen_image
+
+    assert qwen_image.DBCACHE_OPTION == "threshold=0.1", "ghosting/re-exposure bug"
+    assert "warmup" not in qwen_image.DBCACHE_OPTION
+    for eng in qwen_image.ENGINES:
+        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, eng, 1)
+        assert cmd[cmd.index("--cache-mode") + 1] == "dbcache"
+        assert cmd[cmd.index("--cache-option") + 1] == "threshold=0.1"
+        # --offload-to-cpu 去掉反而慢，别動
+        assert "--offload-to-cpu" in cmd
+        # --mmap 統一記憶體下是負收益(+8%)，--eager-load 淨虧 4s，都不要加
+        assert "--mmap" not in cmd and "--eager-load" not in cmd
+
+
+def test_krea2_model_files_exist(_c=None):
+    # M5 有已知 bug（sd.cpp issue 1990）會靜默產出純白 PNG，路徑打錯時 sd-cli
+    # 有時不報錯。模型檔不存在就在跑圖前擋掉，不要等一張白圖回來。
+    from server.workers import qwen_image
+
+    root = Path(qwen_image.DEFAULT_HOME)
+    if not (root / "build" / "bin" / "sd-cli").is_file():
+        return  # 沒裝 sd.cpp 的機器（CI）不檢查模型檔
+    for eng, e in qwen_image.ENGINES.items():
+        for key in ("diff", "vae", "tae", "llm", "vision"):
+            p = e.get(key)
+            if p:
+                assert (root / p).is_file(), f"{eng}.{key} missing: {root / p}"
 
 
 if __name__ == "__main__":

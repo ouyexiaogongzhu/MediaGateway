@@ -147,9 +147,11 @@ async def images_generations(req: ImageGenIn):
             return JSONResponse(status_code=502, content={
                 "error": {"message": f"grok2api 不可达：{e}", "type": "upstream_error"}})
         return {"created": int(time.time()), "data": d.get("data", [])}
-    # Qwen-Image-2.1 路由（model 含 qwen-image）：sd.cpp Metal worker，生圖 API 復活主引擎
+    # 生圖路由（model 含 qwen-image 或 krea2）：sd.cpp Metal worker，生圖 API 復活主引擎
     # （必須匹配 qwen-image 而非 qwen，否則 qwen3.8-27b 等 CHAT 模型名會被吞進生圖）
-    if req.model and "qwen-image" in req.model.lower():
+    # 兩條引擎共用同一個 worker：krea2 是第二引擎（西方寫實質感/直白構圖），
+    # 不在模型名裡寫死就要呼叫端傳 engine，否則 krea2 這條線從 API 走不到。
+    if req.model and any(k in req.model.lower() for k in ("qwen-image", "krea2")):
         data = []
         mlow = req.model.lower()
         unc = "uncensored" in mlow or "nsfw" in mlow
@@ -157,6 +159,8 @@ async def images_generations(req: ImageGenIn):
             params = {"prompt": req.prompt, "width": width, "height": height}
             if unc:
                 params["uncensored"] = True
+            if "krea2" in mlow:
+                params["engine"] = "krea2"
             if req.seed is not None:
                 params["seed"] = req.seed + i
             job = await _wait_job(core.create_job("qwen_image", params)["id"])
@@ -297,14 +301,15 @@ async def images_edits(request: Request):
     if not prompt.strip():
         raise HTTPException(400, "prompt is required")
     n = max(1, min(n or 1, 4))
-    # Qwen-Image-2.1 路由（model 含 qwen-image）：图+文编辑（-r 参考图），走 qwen_image worker
-    if model and "qwen-image" in model.lower():
+    # 生圖路由（model 含 qwen-image 或 krea2）：图+文编辑（-r 参考图），走 qwen_image worker
+    if model and any(k in model.lower() for k in ("qwen-image", "krea2")):
         width, height = _parse_size(size)
         tmpdir = tempfile.mkdtemp(prefix="mg_edits_qwen_")
         try:
             refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
             params = {"prompt": prompt, "width": width, "height": height, "refs": refs}
-            # 模型名带 uncensored/nsfw → UC 去审查档（官方 base/turbo 都会穿衣）
+            # 模型名带 uncensored/nsfw → 走 Krea2（viggle 本身零降级，但 krea2 的
+            # 西方写实质感才是 unc 调用方要的）
             mlow = model.lower()
             if "uncensored" in mlow or "nsfw" in mlow:
                 params["uncensored"] = True
