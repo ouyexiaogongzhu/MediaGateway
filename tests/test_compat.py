@@ -223,6 +223,7 @@ def test_v1_videos_malicious_new_fields(client):
         "prompt": "edge", "first_frame_image": "   ", "mute_audio": "TRUE",
         "input_images": ["", "  ", None]})
     assert r.status_code == 200, r.text
+    wait_done(client, r.json()["id"])  # 必须收尾：video 是排他 job，遗留会堵住后续测试的 FIFO
     p = core.get_job(r.json()["id"])["params"]
     assert p["first_frame"] is None and p["refs"] == []
     assert p["mute_audio"] is True  # "TRUE"/"1"/"yes" 均视为真
@@ -230,6 +231,7 @@ def test_v1_videos_malicious_new_fields(client):
     r2 = client.post("/v1/videos", data={"prompt": "mb", "mute_audio": "1",
                                          "first_frame_image": ""})
     assert r2.status_code == 200, r2.text
+    wait_done(client, r2.json()["id"])
     p2 = core.get_job(r2.json()["id"])["params"]
     assert p2["mute_audio"] is True and p2["first_frame"] is None
     # 坏值：400 + 中文 detail，绝不 500

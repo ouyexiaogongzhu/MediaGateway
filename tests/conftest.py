@@ -11,6 +11,38 @@ from http.server import ThreadingHTTPServer
 import pytest
 
 
+class _FakeEngine:
+    """Stand-in for h3: writes the output file, reports one progress tick.
+
+    Without this the suite loads the real 9B engine and the video job fails
+    (or hangs for minutes). test_compat.py's `__main__` block injects its own
+    copy; under pytest nothing did, so those tests asserted against a failed job.
+    """
+
+    def generate(self, prompt, *, output_path, refs=None, on_progress=None, **ov):
+        with open(output_path, "wb") as f:
+            f.write(b"FAKE")
+        if on_progress:
+            on_progress("denoise", 1, 1)
+        return {"width": ov.get("width"), "height": ov.get("height"),
+                "frames": ov.get("frames", 48), "fps": 24, "seed": 7}
+
+    def close(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def fake_video_engine():
+    """Never load the real h3 engine in tests. Restores the global on teardown."""
+    from server.workers import video
+    saved = video._engine
+    video._engine = _FakeEngine()
+    try:
+        yield
+    finally:
+        video._engine = saved
+
+
 @pytest.fixture
 def tmp_refs(tmp_path):
     """One file per refs kind: image, video_audio (with audio_path), audio.
