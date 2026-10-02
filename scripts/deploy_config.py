@@ -41,8 +41,20 @@ def build() -> dict:
 
 def write(path: str = PLIST_PATH) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    cfg = build()
+    # 保留現有 plist 裡 build() 不認識的 EnvironmentVariables。
+    # ⚠️ GROK_API_KEY 只存在於 plist（無 .env、無 export），build() 也不產它——
+    #    沒有這段合併的話，跑一次 scripts/cutover.py 就把生產金鑰靜默清掉。
+    #    build() 產生的值優先，這裡只補缺，不覆寫。
+    try:
+        with open(path, "rb") as f:
+            old = plistlib.load(f).get("EnvironmentVariables") or {}
+        for k, v in old.items():
+            cfg["EnvironmentVariables"].setdefault(k, v)
+    except FileNotFoundError:
+        pass
     with open(path, "wb") as f:
-        plistlib.dump(build(), f)
+        plistlib.dump(cfg, f)
     return path
 
 
