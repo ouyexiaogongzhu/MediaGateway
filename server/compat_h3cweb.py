@@ -41,6 +41,84 @@ REFS_DIR = os.environ.get("H3CWEB_COMPAT_REFS_DIR",
 
 router = APIRouter()
 
+# --- H3 Context-IR prompt validation ---------------------------------------
+# Spec: ~/.claude/skills/h3-prompt-writing/references/base-en.txt
+# (T2VA/I2VA/FL2VA/L2VA). Field order, the I2VA preamble, the <d> placement
+# rule and the (S1) speaker ids are string-level rules an LLM cannot reliably
+# self-check — hand-writing to this spec missed six of them. So we check here,
+# at the one funnel every caller (canvas, newapi, curl) routes through.
+#
+# Mandatory, not opt-in: h3.c is trained on Context-IR, so a free-text prompt is
+# off-distribution input, and a bad Context-IR prompt fails *silently* (the
+# model just renders whatever it wants) rather than erroring. A 400 with the
+# rule name is cheaper than debugging a wrong video.
+CTX_FIELDS = ("integrated_multimodal_description:",
+              "overall_soundscape:",
+              "non_diegetic_music:")
+CTX_I2VA_PREAMBLE = (
+    "For the target video, at 0.00 seconds into the target video, "
+    "<Picture 1> (from [Shot 1]) is fully referenced.")
+_CTX_D = re.compile(r"<d>\[([^\]]*)\]")
+
+
+def _validate_context_ir(prompt: str, image_refs: int) -> Optional[str]:
+    """Return an error message, or None when the prompt is acceptable.
+
+    image_refs: number of image references. 0 = T2VA (no preamble allowed),
+    1 = I2VA (preamble required verbatim). 2+ is ambiguous between FL2VA and
+    multi-reference Ref2VA, so the preamble is not checked there.
+    """
+    problems = []
+
+    positions = []
+    for field in CTX_FIELDS:
+        hits = [m.start() for m in re.finditer(re.escape(field), prompt)]
+        if not hits:
+            problems.append(f"missing field {field}")
+        elif len(hits) > 1:
+            problems.append(f"field {field} appears {len(hits)} times")
+        positions.append(hits[0] if hits else -1)
+    if all(p >= 0 for p in positions) and positions != sorted(positions):
+        problems.append("fields out of order: expected " + " -> ".join(CTX_FIELDS))
+
+    if image_refs == 1 and not prompt.startswith(CTX_I2VA_PREAMBLE + "\n\n"):
+        problems.append("I2VA prompts must open with the verbatim line "
+                        f"{CTX_I2VA_PREAMBLE!r} followed by a blank line")
+
+    # <d> belongs to integrated_multimodal_description only. Putting dialogue
+    # in overall_soundscape is the single most common and most silent error:
+    # the model then has no dialogue anchor at all.
+    desc_end = prompt.find(CTX_FIELDS[1])
+    if desc_end < 0:
+        desc_end = len(prompt)
+    for match in _CTX_D.finditer(prompt):
+        if match.start() >= desc_end:
+            line = prompt[:match.start()].count("\n") + 1
+            problems.append(f"<d> on line {line} is inside overall_soundscape "
+                            "or non_diegetic_music; dialogue must be inside "
+                            "integrated_multimodal_description")
+
+    # Language tags are English names in the official examples (<d>[English]...,
+    # <d>[Chinese]...), not native script.
+    for tag in _CTX_D.findall(prompt):
+        if not tag.isascii() or not tag.strip():
+            problems.append(f"<d>[{tag}] must name the language in English")
+
+    # Every line needs a speaker id in the run-up to it, e.g.
+    # "...a calm male voice (S1) says in an off-screen voiceover: <d>..."
+    for match in _CTX_D.finditer(prompt):
+        window = prompt[max(0, match.start() - 300):match.start()]
+        if not re.search(r"\(S\d+\)", window):
+            problems.append("<d> has no (S1)/(S2) speaker id in the text "
+                            "preceding it")
+
+    music = prompt.split(CTX_FIELDS[2], 1)[-1].strip() if CTX_FIELDS[2] in prompt else ""
+    if music and music.upper() in ("NO MUSIC.", "NONE", "NO"):
+        problems.append("non_diegetic_music must be 'N/A' or real prose, "
+                        f"not {music!r}")
+
+    return "; ".join(problems) if problems else None
+
 
 class Ref(BaseModel):
     kind: str  # image | video | audio | video_audio
@@ -109,6 +187,12 @@ def info():
 
 @router.post("/jobs")
 def create_job(req: JobRequest):
+    # Mandatory for every h3 render. /v1/videos funnels through this function,
+    # so one check covers both routes. SDXL never gets here (it returns earlier).
+    error = _validate_context_ir(req.prompt,
+                                 sum(1 for r in req.refs if r.kind == "image"))
+    if error:
+        raise HTTPException(400, f"prompt is not valid H3 Context-IR: {error}")
     d = req.model_dump()
     requested = d.pop("output_path")
     refs = []

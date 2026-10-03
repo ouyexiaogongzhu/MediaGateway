@@ -36,6 +36,17 @@ from server.workers import video  # noqa: E402
 
 core.db()  # init SQLite before the scheduler thread starts (lazy init is racy)
 
+# /jobs and /v1/videos gate every h3 prompt on Context-IR, so tests that are
+# about routing/lifecycle still need a conformant prompt to get past the gate.
+CTX_T2VA = ("integrated_multimodal_description: [Shot 1] Live-action, a cat on "
+            "a roof.\n\noverall_soundscape: Distant traffic.\n\n"
+            "non_diegetic_music: N/A")
+CTX_I2VA = ("For the target video, at 0.00 seconds into the target video, "
+            "<Picture 1> (from [Shot 1]) is fully referenced.\n\n"
+            "integrated_multimodal_description: [Shot 1] Live-action, a cat on "
+            "a roof as shown in <Picture 1>.\n\noverall_soundscape: Distant "
+            "traffic.\n\nnon_diegetic_music: N/A")
+
 
 class FakeEngine:
     def close(self):
@@ -62,7 +73,7 @@ def wait_done(client, job_id, timeout=5.0):
 
 def test_post_jobs_params_and_lifecycle(client):
     r = client.post("/jobs", json={
-        "prompt": "cat", "refs": [{"kind": "image", "path": "in.png"}],
+        "prompt": CTX_I2VA, "refs": [{"kind": "image", "path": "in.png"}],
         "width": 864, "height": 480, "seconds": 2, "seed": 5,
         "output_path": "shots/out.mp4",
         "ssd_streaming": True, "core_reuse": 2, "token_reduction": True})
@@ -72,7 +83,7 @@ def test_post_jobs_params_and_lifecycle(client):
     assert body["output_path"] == str(core.ASSET_ROOT / body["job_id"] / "output.mp4")
     assert body["requested_output_path"] == os.path.join(_TMP, "shots", "out.mp4")
     p = core.get_job(body["job_id"])["params"]
-    assert p["prompt"] == "cat" and p["width"] == 864 and p["height"] == 480
+    assert p["prompt"] == CTX_I2VA and p["width"] == 864 and p["height"] == 480
     assert p["seconds"] == 2 and p["seed"] == 5 and p["steps"] == 6
     assert p["refs"][0]["path"] == os.path.join(_TMP, "in.png")  # resolved vs BASE_DIR
     assert p["requested_output_path"].endswith("out.mp4")
@@ -86,7 +97,7 @@ def test_post_jobs_params_and_lifecycle(client):
 
 
 def test_post_jobs_missing_ref_400(client):
-    r = client.post("/jobs", json={"prompt": "x",
+    r = client.post("/jobs", json={"prompt": CTX_I2VA,
                                    "refs": [{"kind": "image", "path": "nope.png"}]})
     assert r.status_code == 400, r.text
     assert "nope.png" in r.json()["detail"]
@@ -100,7 +111,8 @@ def test_v1_videos_json(client):
     data_url = "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
     before = set(os.listdir(compat.REFS_DIR))
     r = client.post("/v1/videos", json={
-        "prompt": "a [IMAGE_1] scene", "size": "512×288", "seconds": "2",
+        "prompt": CTX_I2VA.replace("<Picture 1>", "[IMAGE_1] <Picture 1>"),
+        "size": "512×288", "seconds": "2",
         "input_reference": [data_url]})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -110,7 +122,7 @@ def test_v1_videos_json(client):
     assert new_files, os.listdir(compat.REFS_DIR)
     assert Path(compat.REFS_DIR, new_files[0]).read_bytes() == b"PNGDATA"
     p = core.get_job(body["id"])["params"]
-    assert p["prompt"] == "a scene"  # [IMAGE_N] stripped
+    assert p["prompt"] == CTX_I2VA  # [IMAGE_N] stripped
     assert p["width"] == 512 and p["height"] == 288  # × normalized, already /32
     assert p["seconds"] == 2.0
     assert p["reference_image_size"] == 1
@@ -118,19 +130,21 @@ def test_v1_videos_json(client):
 
 
 def test_v1_videos_size_rounding(client):
-    r = client.post("/v1/videos", json={"prompt": "x", "size": "520x300"})
+    r = client.post("/v1/videos", json={"prompt": CTX_T2VA, "size": "520x300"})
     assert r.status_code == 200, r.text
     p = core.get_job(r.json()["id"])["params"]
     assert p["width"] == 512 and p["height"] == 288  # floored to /32
 
 
 def test_v1_videos_validation(client):
+    # CTX_T2VA so a 400 here can only come from the rule under test — a free-text
+    # prompt would now 400 on the Context-IR gate and pass for the wrong reason.
     for payload, code in (
-        ({"prompt": "x", "size": "1280×960"}, 400),   # cap 768*1344
-        ({"prompt": "x", "size": "abc"}, 400),        # not WxH
-        ({"prompt": "x", "size": "16x16"}, 400),      # too small
-        ({"prompt": "x", "input_reference": ["http://x/y.png"]}, 400),  # not data URL
-        ({"prompt": "x", "video_url": "http://x/v.mp4"}, 400),  # unsupported media
+        ({"prompt": CTX_T2VA, "size": "1280×960"}, 400),   # cap 768*1344
+        ({"prompt": CTX_T2VA, "size": "abc"}, 400),        # not WxH
+        ({"prompt": CTX_T2VA, "size": "16x16"}, 400),      # too small
+        ({"prompt": CTX_T2VA, "input_reference": ["http://x/y.png"]}, 400),  # not data URL
+        ({"prompt": CTX_T2VA, "video_url": "http://x/v.mp4"}, 400),  # unsupported media
         ({"size": "512x288"}, 400),                   # prompt required
     ):
         r = client.post("/v1/videos", json=payload)
@@ -138,7 +152,7 @@ def test_v1_videos_validation(client):
 
 
 def test_v1_videos_multipart(client):
-    r = client.post("/v1/videos", data={"prompt": "mp", "size": "864x480"},
+    r = client.post("/v1/videos", data={"prompt": CTX_I2VA, "size": "864x480"},
                     files={"input_reference": ("a.png", b"BIN", "image/png")})
     assert r.status_code == 200, r.text
     p = core.get_job(r.json()["id"])["params"]
@@ -154,7 +168,7 @@ def _jpeg(b: bytes) -> str:
 def test_v1_videos_multipart_input_images(client):
     """影策协议：input_images 多值（重复字段名 / 单字段 JSON 数组字符串）全进 refs。"""
     d1, d2 = _jpeg(b"IMG1"), _jpeg(b"IMG2")
-    r = client.post("/v1/videos", data={"prompt": "multi"},
+    r = client.post("/v1/videos", data={"prompt": CTX_I2VA},
                     files=[("input_images", (None, d1)), ("input_images", (None, d2))])
     assert r.status_code == 200, r.text
     p = core.get_job(r.json()["id"])["params"]
@@ -164,7 +178,7 @@ def test_v1_videos_multipart_input_images(client):
     assert p["reference_image_size"] == 1
     # 单字段 JSON 数组字符串形式
     r2 = client.post("/v1/videos",
-                     data={"prompt": "arr", "input_images": json.dumps([d1, d2])})
+                     data={"prompt": CTX_I2VA, "input_images": json.dumps([d1, d2])})
     assert r2.status_code == 200, r2.text
     assert len(core.get_job(r2.json()["id"])["params"]["refs"]) == 2
 
@@ -172,7 +186,7 @@ def test_v1_videos_multipart_input_images(client):
 def test_v1_videos_first_frame_and_mute(client):
     """first_frame_image dataURL/本地路径 → params.first_frame（不入 refs）；mute_audio。"""
     r = client.post("/v1/videos", json={
-        "prompt": "ff", "size": "864x480", "first_frame_image": _jpeg(b"FFDATA"),
+        "prompt": CTX_T2VA, "size": "864x480", "first_frame_image": _jpeg(b"FFDATA"),
         "mute_audio": True})
     assert r.status_code == 200, r.text
     p = core.get_job(r.json()["id"])["params"]
@@ -182,45 +196,45 @@ def test_v1_videos_first_frame_and_mute(client):
     assert p["refs"] == []
     # 本地绝对路径直接透传；默认 mute_audio=False
     r2 = client.post("/v1/videos", json={
-        "prompt": "ff2", "first_frame_image": os.path.join(_TMP, "in.png")})
+        "prompt": CTX_T2VA, "first_frame_image": os.path.join(_TMP, "in.png")})
     assert r2.status_code == 200, r2.text
     p2 = core.get_job(r2.json()["id"])["params"]
     assert p2["first_frame"] == os.path.join(_TMP, "in.png")
     assert p2["mute_audio"] is False and p2["refs"] == []
     # 不可达 URL → 400（fail loudly）
     r3 = client.post("/v1/videos", json={
-        "prompt": "ff3", "first_frame_image": "http://127.0.0.1:9/x.png"})
+        "prompt": CTX_T2VA, "first_frame_image": "http://127.0.0.1:9/x.png"})
     assert r3.status_code == 400, r3.text
 
 
 def test_v1_videos_last_frame_image(client):
     """last_frame_image（JSON + multipart）→ params.last_frame，FL2VA 尾帧链路。"""
     r = client.post("/v1/videos", json={
-        "prompt": "lf", "first_frame_image": os.path.join(_TMP, "in.png"),
+        "prompt": CTX_T2VA, "first_frame_image": os.path.join(_TMP, "in.png"),
         "last_frame_image": _jpeg(b"LASTDATA")})
     assert r.status_code == 200, r.text
     p = core.get_job(r.json()["id"])["params"]
     assert Path(p["last_frame"]).read_bytes() == b"LASTDATA"
     assert p["refs"] == []
     # multipart 分支同样解析
-    r2 = client.post("/v1/videos", data={"prompt": "lf2", "last_frame_image": ""})
+    r2 = client.post("/v1/videos", data={"prompt": CTX_T2VA, "last_frame_image": ""})
     assert r2.status_code == 200, r2.text
     assert core.get_job(r2.json()["id"])["params"]["last_frame"] is None
 
 
 def test_v1_videos_refs_frames_mutual_exclusion(client):
     """input_images 与 first/last_frame_image 并发 → 400（h3 Ref2VA 会静默忽略帧，入口显式拒绝）。"""
-    payload = {"prompt": "mix", "input_images": [_jpeg(b"R")], "first_frame_image": os.path.join(_TMP, "in.png")}
+    payload = {"prompt": CTX_I2VA, "input_images": [_jpeg(b"R")], "first_frame_image": os.path.join(_TMP, "in.png")}
     r = client.post("/v1/videos", json=payload)
     assert r.status_code == 400, r.text
-    r2 = client.post("/v1/videos", data={"prompt": "mix2", "input_images": _jpeg(b"R"), "last_frame_image": ""})
+    r2 = client.post("/v1/videos", data={"prompt": CTX_I2VA, "input_images": _jpeg(b"R"), "last_frame_image": ""})
     assert r2.status_code == 200, r2.text  # 空串 last_frame 不算帧，正常放行
 
 
 def test_v1_videos_malicious_new_fields(client):
     """新字段信任边界：空白跳过、bool 宽容解析、空条目跳过、坏值 400 不 500。"""
     r = client.post("/v1/videos", json={
-        "prompt": "edge", "first_frame_image": "   ", "mute_audio": "TRUE",
+        "prompt": CTX_T2VA, "first_frame_image": "   ", "mute_audio": "TRUE",
         "input_images": ["", "  ", None]})
     assert r.status_code == 200, r.text
     wait_done(client, r.json()["id"])  # 必须收尾：video 是排他 job，遗留会堵住后续测试的 FIFO
@@ -228,22 +242,22 @@ def test_v1_videos_malicious_new_fields(client):
     assert p["first_frame"] is None and p["refs"] == []
     assert p["mute_audio"] is True  # "TRUE"/"1"/"yes" 均视为真
     # multipart：mute_audio="1" 宽容解析；空串 first_frame_image 跳过
-    r2 = client.post("/v1/videos", data={"prompt": "mb", "mute_audio": "1",
+    r2 = client.post("/v1/videos", data={"prompt": CTX_T2VA, "mute_audio": "1",
                                          "first_frame_image": ""})
     assert r2.status_code == 200, r2.text
     wait_done(client, r2.json()["id"])
     p2 = core.get_job(r2.json()["id"])["params"]
     assert p2["mute_audio"] is True and p2["first_frame"] is None
     # 坏值：400 + 中文 detail，绝不 500
-    for payload in ({"prompt": "b1", "first_frame_image": 123},
-                    {"prompt": "b2", "input_images": "[not json"},
-                    {"prompt": "b3", "input_images": [_jpeg(b"x"), 7]}):
+    for payload in ({"prompt": CTX_T2VA, "first_frame_image": 123},
+                    {"prompt": CTX_T2VA, "input_images": "[not json"},
+                    {"prompt": CTX_T2VA, "input_images": [_jpeg(b"x"), 7]}):
         r3 = client.post("/v1/videos", json=payload)
         assert r3.status_code == 400, (payload, r3.status_code, r3.text)
 
 
 def test_sora_status_mapping_and_content(client):
-    r = client.post("/v1/videos", json={"prompt": "smoke", "size": "864x480"})
+    r = client.post("/v1/videos", json={"prompt": CTX_T2VA, "size": "864x480"})
     jid = r.json()["id"]
     assert compat._SORA_STATUS == {"queued": "queued", "running": "in_progress",
                                    "completed": "completed", "failed": "failed",
@@ -268,7 +282,7 @@ def test_sora_status_mapping_and_content(client):
     # starlette 非文件 part 默认 1MB 上限曾 400 "Part exceeded maximum size"
     big = "data:image/png;base64," + base64.b64encode(
         b"\x89PNG\r\n\x1a\n" + os.urandom(1_200_000)).decode()
-    r = client.post("/v1/videos", json={"prompt": "big ref", "input_images": [big]})
+    r = client.post("/v1/videos", json={"prompt": CTX_I2VA, "input_images": [big]})
     assert r.status_code == 200, f"{r.status_code} {r.text[:120]}"
     # 影策 newapi 上游取消走 DELETE；重复取消/已结束也 200 + 当前状态
     r = client.post(f"/v1/videos/{jid}/cancel")

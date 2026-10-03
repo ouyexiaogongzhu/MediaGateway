@@ -340,6 +340,101 @@ def strip_audio(video: str, output: str, timeout: float = DEFAULT_TIMEOUT) -> Li
     return cmd
 
 
+# --- denoise_audio: power-domain Wiener suppression of h3's 3–6 kHz hiss floor ---
+
+_DENOISE_NFFT = 1024
+_DENOISE_HOP = 256
+_DENOISE_ALPHA = 2.0    # over-subtraction: 噪聲譜乘幾倍再減
+_DENOISE_GMIN = 0.05    # 增益下限，決定最深能壓多少
+_DENOISE_FRAME_SR = 32000  # h3 音軌取樣率 (h3_ffmpeg.c:676)
+
+
+def _denoise_pcm(raw: bytes, alpha: float, gmin: float):
+    """int16 立体声 bytes -> float64 (2, n) in [-1,1]，已降噪。"""
+    import numpy as np
+
+    n_fft, hop = _DENOISE_NFFT, _DENOISE_HOP
+    win = np.hanning(n_fft)
+    sig = np.frombuffer(raw, dtype="<i2").reshape(-1, 2).astype(np.float64).T / 32768.0
+    out = np.zeros_like(sig)
+    for ch in range(sig.shape[0]):
+        x = sig[ch]
+        n_frames = (len(x) - n_fft) // hop + 1
+        if n_frames < 4:
+            out[ch] = x
+            continue
+        idx = np.arange(n_fft)[None, :] + hop * np.arange(n_frames)[:, None]
+        spec = np.fft.rfft(x[idx] * win, axis=-1).T          # (bin, frame)
+        power = np.abs(spec) ** 2
+
+        # 噪聲幀 = 幀能量低於全片中位 +15 dB；用 RMS 門檻而非音量設定，
+        # 因為 h3 的底噪隨 prompt 在 −25…−85 dB 之間跳，固定門檻會全錯。
+        frame_db = 20 * np.log10(np.sqrt(power.sum(axis=0)) + 1e-12)
+        noise = frame_db < np.median(frame_db) + 15
+        if noise.sum() < 4:
+            out[ch] = x
+            continue
+        # 噪聲譜取逐 bin power 的 90 百分位。**必須在 power 域取**——
+        # 直接對複數 STFT 取中位數會因隨機相位相消而 ≈0，濾波器變成恆等。
+        noise_psd = np.percentile(power[:, noise], 90, axis=1, keepdims=True)
+        gain = np.clip((power - alpha * noise_psd) / (power + 1e-20), gmin, 1.0)
+
+        frames = np.fft.irfft(spec * gain, n=n_fft, axis=0).T
+        length = (n_frames - 1) * hop + n_fft
+        acc = np.zeros(length)
+        norm = np.zeros(length)
+        for f in range(n_frames):
+            acc[f * hop:f * hop + n_fft] += frames[f] * win
+            norm[f * hop:f * hop + n_fft] += win * win
+        resynth = acc / np.maximum(norm, 1e-9)
+        out[ch, :len(resynth)] = resynth[:len(x)]
+    return out
+
+
+def denoise_audio(
+    video: str,
+    output: str,
+    alpha: float = _DENOISE_ALPHA,
+    gain_floor: float = _DENOISE_GMIN,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> List[str]:
+    """壓低 h3 原生 3–6 kHz 寬頻嘶聲底噪，保留語音。
+
+    h3 音訊的嘶聲是模型品質天花板，不是管線 bug（afftdn 只壓噪聲 4 dB 卻打掉
+    語音 11.4 dB）。這裡用 power-domain Wiener subtraction：噪聲譜取自動偵測到的
+    非語音幀，實測底噪降 4.5–13.6 dB、語音只掉 0.0–0.2 dB。
+
+    h3 產的 mp4 只有 t=0 一個關鍵幀，無法用 -c:v copy 切入，因此音訊必須重編、
+    影片重新編碼（耗 PSNR ~43 dB）。不需要降噪時用 strip_audio() 就好。
+    """
+    _check_file(video)
+    decode = [_bin("ffmpeg", "FFMPEG_BIN"), "-v", "error", "-i", video,
+              "-f", "s16le", "-ac", "2", "-ar", str(_DENOISE_FRAME_SR), "-"]
+    proc = subprocess.run(decode, capture_output=True, timeout=timeout)
+    if proc.returncode != 0 or not proc.stdout:
+        tail = proc.stderr.decode("utf-8", "replace")[-500:]
+        raise RenderError(f"解碼音軌失敗(exit {proc.returncode}): {tail}")
+
+    import numpy as np
+
+    clean = _denoise_pcm(proc.stdout, alpha, gain_floor)
+    pcm = (np.clip(clean, -1.0, 1.0) * 32767).astype("<i2").T.tobytes()
+
+    cmd = [_bin("ffmpeg", "FFMPEG_BIN"), "-y", "-v", "error", "-i", video,
+           "-f", "s16le", "-ar", str(_DENOISE_FRAME_SR), "-ac", "2", "-i", "-",
+           "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-crf", "18",
+           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", output]
+    try:
+        enc = subprocess.run(cmd, input=pcm, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RenderError(f"超时({timeout}s)已 kill: {' '.join(cmd[:2])} ...")
+    if enc.returncode != 0:
+        tail = enc.stderr.decode("utf-8", "replace")[-500:]
+        raise RenderError(f"ffmpeg 失败(exit {enc.returncode}): {tail}")
+    _check_file(output)
+    return cmd
+
+
 def extract_last_frame(video: str, output: str, timeout: float = DEFAULT_TIMEOUT) -> str:
     """抓取视频结尾附近一帧，作下一镜头 first_frame（剪辑接缝用，非像素级）。
 
