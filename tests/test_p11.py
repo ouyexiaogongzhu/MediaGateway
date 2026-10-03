@@ -28,6 +28,20 @@ from server.main import app  # noqa: E402
 from server.workers import concat as concat_worker  # noqa: E402
 from server.workers import mix as mix_worker  # noqa: E402
 
+# h3 只吃 Context-IR，compat_h3cweb 的 gate 是強制的（壞 prompt 不報錯、只靜默
+# 渲染出別的東西）。佔位 "x" 會被 gate 擋下，於是斷言 400 的測試會因為錯誤的
+# 理由通過＝測試假綠。帶參考圖用 I2VA（要逐字前導句），純文字用 T2VA。
+CTX_T2VA = ("integrated_multimodal_description: [Shot 1] Live-action, a static "
+            "medium shot frames a rain-soaked cyclist at night.\n\n"
+            "overall_soundscape: Steady rain taps the pavement.\n\n"
+            "non_diegetic_music: N/A")
+CTX_I2VA = ("For the target video, at 0.00 seconds into the target video, "
+            "<Picture 1> (from [Shot 1]) is fully referenced.\n\n"
+            "integrated_multimodal_description: [Shot 1] Live-action, a static "
+            "medium shot continues the action shown in <Picture 1>.\n\n"
+            "overall_soundscape: Steady rain taps the pavement.\n\n"
+            "non_diegetic_music: N/A")
+
 
 def _wav_bytes(rate=48000, channels=1, bits=16, seconds=0.1) -> bytes:
     data = b"\x00" * int(rate * channels * bits // 8 * seconds)
@@ -82,21 +96,25 @@ def test_v1_videos_accepts_audio_refs():
             png = "data:image/png;base64," + base64.b64encode(b"PNG").decode()
             mp3 = "data:audio/mpeg;base64," + base64.b64encode(b"MP3DATA").decode()
             r = client.post("/v1/videos", json={
-                "prompt": "x", "size": "864x480", "input_reference": [png],
+                "prompt": CTX_I2VA, "size": "864x480", "input_reference": [png],
                 "audios": [mp3], "audio_url": str(wav)})
             assert r.status_code == 200, r.text
             refs = fake.calls[0][1]["refs"]
             assert [x["kind"] for x in refs] == ["image", "audio", "audio"]  # 先圖後音頻
             assert Path(refs[1]["path"]).read_bytes() == b"MP3DATA"
             assert refs[2]["path"] == str(wav)
-            # video refs still rejected
-            r = client.post("/v1/videos", json={"prompt": "x", "videos": ["a.mp4"]})
+            # video refs still rejected. 用合規 prompt：這些斷言的是「videos 欄位
+            # 被拒」，prompt 若被 gate 擋下就會因錯誤的理由 400＝測試假綠。
+            r = client.post("/v1/videos", json={"prompt": CTX_T2VA, "videos": ["a.mp4"]})
             assert r.status_code == 400, r.text
-            r = client.post("/v1/videos", json={"prompt": "x", "reference_videos": "v"})
+            assert "videos" in r.json()["detail"], r.text
+            r = client.post("/v1/videos", json={"prompt": CTX_T2VA, "reference_videos": "v"})
             assert r.status_code == 400, r.text
+            assert "reference_videos" in r.json()["detail"], r.text
             # audio value that is neither data URL nor existing abs path
-            r = client.post("/v1/videos", json={"prompt": "x", "audio_url": "http://x/a.mp3"})
+            r = client.post("/v1/videos", json={"prompt": CTX_T2VA, "audio_url": "http://x/a.mp3"})
             assert r.status_code == 400, r.text
+            assert "audio_url" in r.json()["detail"], r.text
 
 
 def test_mix_worker_sfx_and_validation():

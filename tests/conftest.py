@@ -32,15 +32,22 @@ class _FakeEngine:
 
 
 @pytest.fixture(autouse=True)
-def fake_video_engine():
-    """Never load the real h3 engine in tests. Restores the global on teardown."""
+def fake_video_engine(monkeypatch):
+    """Never load the real h3 engine in tests.
+
+    Patch the factory, not the global: video.run() nulls `_engine` after every
+    job (unload-by-default), so a value assigned once is gone by the next call.
+    Also leave `_get_engine` alone when a test has injected its own engine
+    (test_video.py sets video._engine = FakeEngine() and asserts on it).
+    """
     from server.workers import video
-    saved = video._engine
+    saved_engine, saved_get = video._engine, video._get_engine
     video._engine = _FakeEngine()
+    monkeypatch.setattr(video, "_get_engine", lambda: video._engine or _FakeEngine())
     try:
         yield
     finally:
-        video._engine = saved
+        video._engine, video._get_engine = saved_engine, saved_get
 
 
 @pytest.fixture
