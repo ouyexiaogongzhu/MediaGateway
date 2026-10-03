@@ -86,6 +86,10 @@ def unload() -> bool:
 
 def _ensure_server(progress):
     global _proc, _last_use
+    # Lock covers the health check and the spawn ONLY. The readiness poll below
+    # can burn 180s, and busy()/resident() take this same lock — holding it across
+    # the wait froze the scheduler thread (core._admit_next calls both on the queue
+    # head for video/shot/qwen_image). llm.py:146-172 already solves it this way.
     with _lock:
         _last_use = time.time()
         if _healthy():
@@ -98,14 +102,14 @@ def _ensure_server(progress):
                     cwd=TTS_DIR, stdout=log, stderr=log)
             finally:
                 log.close()  # child keeps its dups; parent handle not needed
-        progress(0.05, "starting tts")
-        deadline = time.time() + 180
-        while time.time() < deadline:
-            if _healthy():
-                return
-            time.sleep(1)
-        raise RuntimeError("tts server model not loaded after 180s "
-                           f"(log: {TTS_DIR}/tts_server.log)")
+    progress(0.05, "starting tts")
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if _healthy():
+            return
+        time.sleep(1)
+    raise RuntimeError("tts server model not loaded after 180s "
+                       f"(log: {TTS_DIR}/tts_server.log)")
 
 
 def _watchdog():

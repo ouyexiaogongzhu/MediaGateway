@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .. import render
+from ._util import job_output
 
 TYPE = "concat"
 MEM_GB = 1  # pure ffmpeg CPU
@@ -15,7 +16,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         raise ValueError("shots must be a list of ≥2 video paths")
     if not all(isinstance(s, str) and s for s in shots):
         raise ValueError("shots entries must be non-empty strings")
-    output = str(job_dir / params.get("output_name", "final.mp4"))
+    output = job_output(job_dir, params)
     segs = params.get("music_segments")
     if not segs:
         render.concat(shots, output,

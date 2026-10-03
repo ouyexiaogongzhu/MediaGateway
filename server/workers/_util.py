@@ -9,6 +9,21 @@ import os
 import signal
 import subprocess
 import time
+from pathlib import Path
+
+
+def job_output(job_dir, params, default="final.mp4"):
+    """Resolve params['output_name'] inside job_dir, refusing escapes.
+
+    `job_dir / name` drops the left side entirely when name is absolute, and
+    `..` walks out — and the mux runs ffmpeg -y, so that is arbitrary file
+    overwrite driven by the free-form /v1/jobs params dict.
+    """
+    out = (Path(job_dir) / str(params.get("output_name", default))).resolve()
+    root = Path(job_dir).resolve()
+    if out != root and root not in out.parents:
+        raise ValueError("output_name must stay inside the job directory")
+    return str(out)
 
 
 def number(params: dict, key: str, default, lo, hi, cast):

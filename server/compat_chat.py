@@ -205,8 +205,12 @@ def _upstream_error(message: str, status: int = 502) -> JSONResponse:
 
 
 def _video_running() -> bool:
+    # Must mirror core._admit_next's heavy-job list (core.py:232). qwen_image runs
+    # sd.cpp at MEM_GB 26 / RSS 22-27GB; core.py:229-231 documents the kernel kill
+    # when it coexists with the 19GB resident LLM. Omitting it let chat load 19GB
+    # straight into a running image job, bypassing every scheduler guard.
     rows = core.db().execute(
-        "SELECT 1 FROM jobs WHERE status='running' AND type IN ('video','shot') LIMIT 1"
+        "SELECT 1 FROM jobs WHERE status='running' AND type IN ('video','shot','qwen_image') LIMIT 1"
     ).fetchall()
     return bool(rows)
 
@@ -247,7 +251,12 @@ def chat_completions(req: ChatRequest):
         m = body.get("model") or ""
         body["model"] = _MODEL_REWRITE.get(m.lower(), m)  # 路由大小寫不敏感，重寫也必須是
         if base == OMLX_BASE:
-            _ensure_omlx()  # 按需：探活失敗才 spawn（19GB 進程不常駐）
+            try:
+                _ensure_omlx()  # 按需：探活失敗才 spawn（19GB 進程不常駐）
+            except RuntimeError as e:
+                # "omlx unloading"（視頻互斥讓路中）與 300s 未就緒都是預期狀態，
+                # 不接住會穿出路由變成無結構 500——與本地 qwen 分支同一個處理。
+                return _upstream_error(f"LLM 不可用：{e}")
             _omlx_busy_enter()  # chat 在飛——watchdog 不殺
         if req.stream:
             # 供應商（grok2api/omlx）支持 SSE：逐塊透傳。

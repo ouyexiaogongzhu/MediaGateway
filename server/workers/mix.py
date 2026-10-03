@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 
 from .. import core, render
+from ._util import job_output
 
 TYPE = "mix"
 MEM_GB = 1
@@ -94,7 +95,7 @@ def _run_mux(params: dict, job_dir: Path, progress, cancel) -> dict:
             for t in tracks):
         raise ValueError(
             "audio_tracks 必须是 [{path, start?, loop?}] 列表（path 必填非空）")
-    output = str(job_dir / params.get("output_name", "final.mp4"))
+    output = job_output(job_dir, params)
     if cancel():
         raise Exception("cancelled")
     progress(0.1, "muxing")
