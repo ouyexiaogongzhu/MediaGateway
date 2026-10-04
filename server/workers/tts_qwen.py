@@ -24,6 +24,10 @@ DEFAULT_TIMEOUT = 600.0
 # callers often send none. Options: serena vivian uncle_fu ryan aiden ono_anna
 # sohee eric dylan (model.get_supported_speakers()).
 DEFAULT_VOICE = "serena"
+TTS_SPEAKERS = frozenset({
+    "serena", "vivian", "uncle_fu", "ryan", "aiden",
+    "ono_anna", "sohee", "eric", "dylan",
+})
 
 
 def _wav_rate(path: Path):

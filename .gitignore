@@ -22,3 +22,6 @@ __pycache__/
 
 # 測試期間由 sqlite 在 repo 根目錄產生的空檔（正式庫在 data/gateway.db）
 /gateway.db
+
+# 誤在 repo 根目錄跑 sqlite3 造出的空檔（正式庫在 data/）
+/open_ai_canvas.db

@@ -163,6 +163,56 @@ def test_mix_worker_sfx_and_validation():
         assert "-an" in cmd2 and "-filter_complex" not in cmd2
 
 
+def test_sfx_seed_reproducible_and_continuous():
+    """P1-10: sfx_seed makes the pick reproducible AND continuous across shots.
+
+    Runs against the REAL assets/sfx tree — the temp tree above holds one file
+    per tag, where every seed maps to the same path and these assertions would
+    pass for free.
+    """
+    saved = mix_worker.core.ASSET_ROOT
+    mix_worker.core.ASSET_ROOT = ROOT / "assets"
+    try:
+        rain = sorted((ROOT / "assets" / "sfx" / "ambience_rain").iterdir())
+        assert len(rain) >= 4, f"need variants for a real test, got {len(rain)}"
+
+        # reproducible: same tag+seed → same file, every time
+        picks = {mix_worker._pick_sfx("ambience_rain", 42) for _ in range(5)}
+        assert len(picks) == 1, picks
+        # ...and distinct seeds really do spread over distinct recordings
+        assert len({mix_worker._pick_sfx("ambience_rain", s)
+                    for s in range(len(rain))}) == len(rain)
+
+        # continuity: 5 shots of one scene, one scene-level seed → 5x the same file
+        shots = [{"sfx_tag": "ambience_rain", "sfx_seed": 42} for _ in range(5)]
+        resolved = [mix_worker._resolve_track(t)["path"] for t in shots]
+        assert len(set(resolved)) == 1, resolved
+        assert set(resolved) == picks
+
+        # loud failures — never a silent fall back to random
+        for track, msg in [
+            ({"sfx_tag": "ambience_rain", "sfx_seed": "abc"}, "sfx_seed must be a number"),
+            ({"sfx_tag": "ambience_rain", "sfx_seed": -1}, "sfx_seed out of range"),
+            ({"sfx_tag": "ambience_rain", "sfx_seed": 2 ** 32}, "sfx_seed out of range"),
+            ({"sfx_tag": "nope", "sfx_seed": 1}, "no sfx files"),
+        ]:
+            try:
+                mix_worker._resolve_track(track)
+                raise AssertionError(f"expected ValueError for {track}")
+            except ValueError as e:
+                assert msg in str(e), (track, str(e))
+
+        # backward compat: sfx_tag alone still resolves to one of the variants
+        for _ in range(5):
+            got = mix_worker._resolve_track({"sfx_tag": "ambience_rain"})["path"]
+            assert Path(got) in rain, got
+        # ...and seed 0 is a real seed, not "unset" (cf. _util.seed_of)
+        assert mix_worker._resolve_track(
+            {"sfx_tag": "ambience_rain", "sfx_seed": 0})["path"] == str(rain[0])
+    finally:
+        mix_worker.core.ASSET_ROOT = saved
+
+
 def test_v1_music_route():
     with tempfile.TemporaryDirectory() as d:
         fake = FakeJob(str(Path(d) / "o.wav"))

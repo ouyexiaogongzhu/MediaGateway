@@ -4,6 +4,7 @@ Run: .venv/bin/python tests/test_video.py
 """
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,7 +57,7 @@ def test_profile_expansion():
         with tempfile.TemporaryDirectory() as d:
             for i, (params, check) in enumerate([
                 ({"prompt": "x", "profile": "quality"},
-                 lambda ov: (ov["steps"] == 20 and ov["core_reuse"] == 4
+                 lambda ov: (ov["steps"] == 20 and "core_reuse" not in ov
                              and ov["token_reduction"] == 1 and ov["dit_layers"] == 45)),
                 ({"prompt": "x", "profile": "draft", "seconds": 5},
                  lambda ov: ov["render_width"] == 576 and ov["render_height"] == 320
@@ -72,6 +73,10 @@ def test_profile_expansion():
                               cancel=lambda: False)
                 ov = eng.calls[i]["overrides"]
                 assert check(ov), (i, ov)
+        # 白盒断言：core_reuse 是分辨率相关的画质旋钮，不许被回填进任何 profile
+        # （守卫只兜住画布面积，profile 里留着就是每次生产渲染都刷一条警告）。
+        assert "core_reuse" not in video._PROFILES["quality"], \
+            "quality profile 不得携带 core_reuse（见 video.CORE_REUSE_SAFE_PX）"
     finally:
         video._engine = saved
 
@@ -102,6 +107,64 @@ def test_keep_loaded_keeps_engine():
         assert video._engine is eng
     finally:
         video._engine = saved
+
+
+def test_large_resolution_clamps_core_reuse():
+    """正片分辨率的 core_reuse=4 必须夹回缺省：job 照跑、只少一个旋钮。
+
+    544x960 = 522240px 是实测画质被毁的那一档；864x480 是默认交付尺寸。
+    """
+    for w, h in ((544, 960), (864, 480)):
+        eng = FakeEngine()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result, calls = run_with({"prompt": "x", "profile": "quality",
+                                      "width": w, "height": h, "core_reuse": 4}, eng)
+        ov = calls[0]["overrides"]
+        assert "core_reuse" not in ov, (w, h, ov)  # 缺省 1 = 不发这个 flag
+        assert ov["width"] == w and ov["height"] == h, ov  # 只夹 core_reuse
+        assert ov["steps"] == 20 and ov["token_reduction"] == 1, ov  # profile 其余仍在
+        assert result["output_path"]  # 夹紧不是报错：产物照出
+        assert [str(x.message) for x in caught
+                if "core_reuse=4 clamped to 1" in str(x.message)], \
+            [(w, h), [str(x.message) for x in caught]]  # 偏差必须留痕
+
+
+def test_internal_canvas_skipped_when_indivisible():
+    """_internal_canvas 回 None（縮放後等於原尺寸／互素比例／k<1）時要靜默放棄，
+    不能解包炸掉。draft 帶顯式交付解析度就是這條路徑。"""
+    eng = FakeEngine()
+    _, calls = run_with({"prompt": "x", "profile": "draft",
+                         "width": 512, "height": 288, "seconds": 2}, eng)
+    ov = calls[0]["overrides"]
+    assert "render_width" not in ov and "render_height" not in ov
+
+
+def test_draft_resolution_keeps_core_reuse():
+    """288x512 = 147456px 是实测双赢的一档，守卫不能误伤。"""
+    eng = FakeEngine()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, calls = run_with({"prompt": "x", "width": 288, "height": 512,
+                             "core_reuse": 4}, eng)
+    ov = calls[0]["overrides"]
+    assert ov["core_reuse"] == 4, ov
+    assert ov["width"] == 288 and ov["height"] == 512, ov
+    assert not caught, [str(x.message) for x in caught]
+
+
+def test_guard_measures_internal_canvas():
+    """internal canvas 才是 DiT 实际跑 core_reuse 的地方：它小就放行 4。"""
+    eng = FakeEngine()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, calls = run_with({"prompt": "x", "width": 864, "height": 480,
+                             "render_width": 288, "render_height": 512,
+                             "core_reuse": 4}, eng)
+    ov = calls[0]["overrides"]
+    assert (ov["render_width"], ov["render_height"]) == (288, 512), ov
+    assert ov["core_reuse"] == 4, ov
+    assert not caught, [str(x.message) for x in caught]
 
 
 def test_defaults_and_param_mapping():

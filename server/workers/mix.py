@@ -4,8 +4,17 @@ Two param shapes:
 - audio_tracks (render.mux, re-encode): {video, audio_tracks: [{path, start?, loop?}],
   output_name?="final.mp4", subtitles?, dialogue_volume?, music_volume?}
 - tracks (legacy, -c:v copy): [{"sfx_tag": "wind" | "path": "/abs/file.mp3",
-  "gain_db": 0.0, "start_s": 0.0}] — sfx_tag picks a random file from
+  "gain_db": 0.0, "start_s": 0.0}] — sfx_tag picks a file from
   MG_ASSETS/sfx/<tag>/. Empty tracks strips audio.
+
+sfx_tag + sfx_seed (P1-10): no seed → random, exactly as before. With
+  sfx_seed (int) the pick is `sorted(variants)[seed % n]` — re-running a shot
+  reproduces the same bytes, and every shot of a scene that passes the SAME
+  seed gets the SAME recording, so a 5-shot rain scene is one continuous rain
+  instead of five. The caller owns the seed (scene-level, not shot-level).
+  Unknown tag and non-int seed both raise — never a silent random fallback.
+  ponytail: variant indices drift if the library gains/loses files (the mod
+  remaps every seed). Pin by filename instead if that ever bites.
 """
 from __future__ import annotations
 
@@ -17,7 +26,7 @@ import threading
 from pathlib import Path
 
 from .. import core, render
-from ._util import job_output
+from ._util import job_output, number
 
 TYPE = "mix"
 MEM_GB = 1
@@ -31,13 +40,24 @@ _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 _run_lock = threading.Lock()
 
 
-def _pick_sfx(tag: str) -> str:
+def _pick_sfx(tag: str, seed: int | None = None) -> str:
     d = core.ASSET_ROOT / "sfx" / tag
     files = sorted(p for p in d.iterdir()
                    if p.is_file() and p.suffix.lower() in _AUDIO_EXTS) if d.is_dir() else []
     if not files:
         raise ValueError(f"no sfx files for tag {tag!r} ({d})")
-    return str(random.choice(files))
+    return str(files[seed % len(files)] if seed is not None else random.choice(files))
+
+
+def _resolve_track(t: dict) -> dict:
+    """sfx_tag(+sfx_seed) → absolute path. Raises on an unknown tag/seed."""
+    t = dict(t)
+    if t.get("sfx_tag"):
+        t["path"] = _pick_sfx(t["sfx_tag"],
+                              number(t, "sfx_seed", None, 0, 0xFFFFFFFF, int))
+    if not t.get("path") or not Path(t["path"]).is_file():
+        raise ValueError(f"track file not found: {t.get('path')}")
+    return t
 
 
 def _video_duration(path: str) -> float:
@@ -125,14 +145,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
             raise ValueError("tracks entries must be objects")
         if not (t.get("path") or t.get("sfx_tag")):
             raise ValueError("track needs path or sfx_tag")
-    resolved = []
-    for t in tracks:
-        t = dict(t)
-        if t.get("sfx_tag"):
-            t["path"] = _pick_sfx(t["sfx_tag"])
-        if not t.get("path") or not Path(t["path"]).is_file():
-            raise ValueError(f"track file not found: {t.get('path')}")
-        resolved.append(t)
+    resolved = [_resolve_track(t) for t in tracks]
 
     out = job_dir / "output.mp4"
     if cancel():

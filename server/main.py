@@ -58,6 +58,7 @@ class ShotIn(BaseModel):
     video: Optional[dict] = None
     voice: Optional[dict] = None
     music: Optional[dict] = None
+    sfx: Optional[dict] = None
     mix: Optional[dict] = None
 
 

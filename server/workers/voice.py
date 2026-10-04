@@ -1,166 +1,47 @@
-"""Voice worker: TTS via CosyVoice microservice (127.0.0.1:8001).
+"""Voice worker: thin router to the Qwen3-TTS MLX engine (tts_qwen).
 
-The torch model lives in its own process (cosyvoice .venv) — this worker only
-does HTTP through vendor/cosyvoice/client.py. Lifecycle is owned here:
-spawn on first job, auto-exit after COSYVOICE_IDLE_EXIT_S (default 300s)
-without jobs. An externally-started server is used but never killed.
-Passing params.base_url skips lifecycle entirely (caller manages the server).
+CosyVoice was retired 2026-10-04 (no Cantonese G2P in CosyVoice3's tokenizer —
+pronunciation errors were architectural, not a version problem). Everything now
+goes through mlx-audio; this module stays because shot.py and the scheduler
+address the "voice" job type.
+
+The scheduler calls busy()/resident()/request_unload() on this module to keep
+GPU-heavy jobs from stacking. tts_qwen is a per-job subprocess that exits when
+the job ends, so nothing is resident between jobs and unload is a no-op — the
+hooks stay only because core._admit_next looks them up by module name.
 """
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import sys
-import threading
-import time
-import urllib.request
 from pathlib import Path
 
-VENDOR = Path(__file__).resolve().parent.parent.parent / "vendor"
-if str(VENDOR) not in sys.path:
-    sys.path.insert(0, str(VENDOR))
-
-from cosyvoice import client as _client  # noqa: E402
-
 TYPE = "voice"
-MEM_GB = 8.7  # TTS 进程运行期间(torchaudio+模型); 供调度预算参考
-
-TTS_DIR = os.environ.get("COSYVOICE_DIR", "/Users/vincent/tool/cosyvoice")
-IDLE_EXIT_S = float(os.environ.get("COSYVOICE_IDLE_EXIT_S", "300"))
-
-_proc: subprocess.Popen | None = None
-_last_use = 0.0
-_busy = False  # a synthesis is in flight — watchdog must not kill the server
-_unload_pending = False
-_lock = threading.Lock()
-
-
-def _healthy() -> bool:
-    try:
-        with urllib.request.urlopen(
-                f"{_client.DEFAULT_BASE_URL}/health", timeout=2) as r:
-            return json.loads(r.read()).get("model_loaded") is True
-    except Exception:  # noqa: BLE001 - not up yet == unhealthy
-        return False
+MEM_GB = 8.7  # 排程預算用的峰值（TTS 進程運行期間）
 
 
 def busy() -> bool:
-    """合成进行中 —— 调度器不得此时卸载。"""
-    with _lock:
-        return _busy
-
-
-def resident() -> bool:
-    """TTS 服务器进程还活着（占用 GPU 内存）。"""
-    with _lock:
-        return _proc is not None and _proc.poll() is None
-
-
-def request_unload() -> None:
-    """video/shot 准入前由调度器调用：终止常驻 tts server 让出显存。
-    与 watchdog 同样只在非 busy 时动手；正在合成则交给 watchdog 稍后再杀。"""
-    global _unload_pending
-    with _lock:
-        if _busy:
-            _unload_pending = True
-            return
-    unload()
-
-
-def unload() -> bool:
-    global _proc
-    with _lock:
-        proc, _proc = _proc, None
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-            return True
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-            return True
+    """合成进行中 —— 调度器不得此时卸载。tts_qwen 是短任務子進程，不常駐。"""
     return False
 
 
-def _ensure_server(progress):
-    global _proc, _last_use
-    # Lock covers the health check and the spawn ONLY. The readiness poll below
-    # can burn 180s, and busy()/resident() take this same lock — holding it across
-    # the wait froze the scheduler thread (core._admit_next calls both on the queue
-    # head for video/shot/qwen_image). llm.py:146-172 already solves it this way.
-    with _lock:
-        _last_use = time.time()
-        if _healthy():
-            return
-        if _proc is None or _proc.poll() is not None:
-            log = open(os.path.join(TTS_DIR, "tts_server.log"), "ab")
-            try:
-                _proc = subprocess.Popen(
-                    [os.path.join(TTS_DIR, ".venv/bin/python"), "tts_server.py"],
-                    cwd=TTS_DIR, stdout=log, stderr=log)
-            finally:
-                log.close()  # child keeps its dups; parent handle not needed
-    progress(0.05, "starting tts")
-    deadline = time.time() + 180
-    while time.time() < deadline:
-        if _healthy():
-            return
-        time.sleep(1)
-    raise RuntimeError("tts server model not loaded after 180s "
-                       f"(log: {TTS_DIR}/tts_server.log)")
+def resident() -> bool:
+    """tts_qwen 每個 job 開子進程、跑完即退，job 之間不佔顯存。"""
+    return False
 
 
-def _watchdog():
-    # only ever kills a server we spawned ourselves, and never while a
-    # synthesis is in flight (_busy) even if it outlives IDLE_EXIT_S
-    global _proc
-    while True:
-        time.sleep(30)
-        with _lock:
-            if (_proc is not None and _proc.poll() is None and not _busy
-                    and time.time() - _last_use > IDLE_EXIT_S):
-                _proc.terminate()
-                if _proc.wait(timeout=5) is None:
-                    _proc.kill()  # graceful shutdown 卡住：强杀
-                _proc = None
+def request_unload() -> None:
+    """沒有常駐進程可殺 —— 每次 job 的記憶體由 MEM_GB 排程預算管。"""
 
 
-threading.Thread(target=_watchdog, daemon=True).start()
+# CosyVoice 已退役，唯一引擎是 tts_qwen。engine 字段若还在请求里，明确拒绝而不是
+# 静默换引擎：拿到 cosyvoice 却静默出 TTS 音，查起来要翻三层才知道发生了什么。
+_KNOWN_ENGINES = {"", "qwen", "qwen3", "qwen3-tts", "tts_qwen"}
 
 
 def run(params: dict, job_dir: Path, progress, cancel) -> dict:
-    text = (params.get("text") or "").strip()
-    if not text:
-        raise ValueError("text 必填")
-    if not (params.get("voice") or (params.get("prompt_wav") and params.get("prompt_text"))):
-        raise ValueError("需要 voice (voices.json voiceId) 或 prompt_wav+prompt_text")
-    if cancel():  # TTS 短任务, 提交前检查一次即可
-        raise RuntimeError("cancelled before start")
-
-    if not params.get("base_url"):
-        _ensure_server(progress)
-
-    progress(0.1, "synthesizing")
-    out = str(job_dir / "dialogue.wav")
-    global _busy
-    with _lock:
-        _busy = True
-    try:
-        out, sample_rate = _client.synthesize(
-            text,
-            voice=params.get("voice"),
-            out=out,
-            prompt_wav=params.get("prompt_wav"),
-            prompt_text=params.get("prompt_text"),
-            speed=float(params.get("speed", 1.0)),
-            base_url=params.get("base_url") or _client.DEFAULT_BASE_URL,
-        )
-    except SystemExit as e:  # client 用 SystemExit 报错; 调度器只捕 Exception
-        raise RuntimeError(f"TTS failed: {e.code or e}") from None
-    finally:
-        with _lock:
-            _busy = False
-            _last_use = time.time()
-    return {"output_path": out, "sample_rate": sample_rate}
+    engine = str(params.get("engine") or "").strip().lower()
+    if engine not in _KNOWN_ENGINES:
+        raise ValueError(
+            f"unsupported voice engine {params.get('engine')!r}; "
+            "cosyvoice was retired 2026-10-04, only tts_qwen remains")
+    from . import tts_qwen
+    return tts_qwen.run(params, job_dir, progress, cancel)

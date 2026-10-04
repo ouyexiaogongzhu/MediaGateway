@@ -10,6 +10,7 @@ import contextlib
 import math
 import os
 import threading
+import warnings
 from pathlib import Path
 
 from vendor.h3_bridge import H3Engine
@@ -75,14 +76,21 @@ def _build_refs(refs) -> list:
 
 # P0 benchmark 定档（docs/h3_speed_plan.md，M5 Pro 实测 2026-09-05）：
 # quality=D 4.6× vs reference；draft=G 11.7×；int8 零收益已剔除
+# 别把 core_reuse 塞回任何 profile：它是分辨率相关的画质下限旋钮（见
+# CORE_REUSE_SAFE_PX），而 profile 是"挑名字就得到好结果"的默认档。
 _PROFILES = {
     "standard": {},
-    "quality": {"steps": 20, "dit_layers": 45, "core_reuse": 4,
-                "token_reduction": True},
+    "quality": {"steps": 20, "dit_layers": 45, "token_reduction": True},
     "draft": {"steps": 6, "dit_layers": 45, "denoise_reuse": 1,
               "token_reduction": True, "_internal": 0.667},
     "reference": {"steps": 20, "dit_layers": 50, "denoise_reuse": 1},
 }
+
+# core_reuse>=4 的画质下限随分辨率走（2026-10-02 T4 实测，docs/h3_speed_plan.md）：
+# 288x512 = 147456 px 是双赢；544x960 = 522240 px 画面被毁成涂抹噪点
+# （dispatch 减半、端到端 -41%，但不能用于正片）。两点之间没测过，阈值取
+# 略偏保守的 262144 px（= 512x512，几何中点 277k 往下取整）。
+CORE_REUSE_SAFE_PX = 262_144
 
 
 def _internal_canvas(width: int, height: int, factor: float):
@@ -115,15 +123,13 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         height=height,
         # 默认走 WorkBuddy 62 链交付实证档（2026-09-07，768x1344 ≈2.5 分/镜）：
         # steps 4 = klein 蒸馏原生；denoise_reuse 必须留 1（h3.c:574 拒绝 core_reuse>1 且 denoise_reuse>1）。
-        # core_reuse 缺省 1：4 虽 dispatch 减半且草稿画质不劣，但 544x960 实测画面被毁。
         steps=int(params.get("steps", profile.get("steps", 4))),
         denoise_reuse=int(params.get("denoise_reuse", profile.get("denoise_reuse", 1))),
         dit_layers=int(params.get("dit_layers", profile.get("dit_layers", 45))),
     )
     # core_reuse/token_reduction/ssd_streaming mirror h3cweb: only send non-defaults.
-    # 哨兵合并：显式键（含显式 false/0）优先于 profile
-    # 缺省=1（2026-10-02 T4 实测改）：4 在 288x512 更快，但在 544x960/f362
-    # 把画面毁成涂抹噪点——wait/frame 减半、端到端 -41%，却不能用于正片。
+    # 哨兵合并：显式键（含显式 false/0）优先于 profile；缺省=1（= 不发这个 flag）。
+    # 4 是不是安全由下面的 CORE_REUSE_SAFE_PX 守卫按画布面积判，不在这一行。
     core = int(params["core_reuse"]) if "core_reuse" in params else int(profile.get("core_reuse", 1))
     if core > 1:
         overrides["core_reuse"] = core
@@ -139,7 +145,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         overrides["render_width"] = _round32(params["render_width"])
         overrides["render_height"] = _round32(params["render_height"])
     elif internal_factor:
-        rw, rh = _internal_canvas(width, height, internal_factor)
+        rw, rh = _internal_canvas(width, height, internal_factor) or (None, None)
         if rw:
             overrides["render_width"], overrides["render_height"] = rw, rh
     # 1 second = 24 frames; seconds wins over frames (same as h3cweb).
@@ -162,6 +168,23 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
             f"denoise_reuse={overrides['denoise_reuse']} (h3.c:574 rejects the pair); "
             "set one of them to 1")
 
+    # 画质守卫：显式 core_reuse>=4 撞上超过 CORE_REUSE_SAFE_PX 的画布就夹回缺省。
+    # 判据是"实际生成的那块画布"——internal canvas（render_*）才是 DiT 真正
+    # 跑 core_reuse 的地方，比交付分辨率更接近实测条件。
+    # 夹紧而不是报错：阈值是两个实测点插出来的，中间尺寸（640x360=230400 这类）
+    # 没测过，硬拒会在深夜批量里整批失败并浪费已经排好的 GPU 队列；
+    # 夹紧最坏只是慢一点，产物永远可用，且偏差写进 stderr。
+    if overrides.get("core_reuse", 1) >= 4:
+        gw = overrides.get("render_width", overrides["width"])
+        gh = overrides.get("render_height", overrides["height"])
+        if gw * gh > CORE_REUSE_SAFE_PX:
+            bad = overrides.pop("core_reuse")  # 缺省 1 == 不发这个 flag
+            warnings.warn(
+                f"core_reuse={bad} clamped to 1 at {gw}x{gh} "
+                f"({gw * gh}px > {CORE_REUSE_SAFE_PX}): measured to destroy image "
+                "quality above this size (288x512 ok, 544x960 ruined)",
+                stacklevel=2)
+
     refs = _build_refs(params.get("refs"))
     output_path = str(job_dir / "output.mp4")
 
@@ -175,9 +198,10 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         progress(done / total if total else 0.0, phase)
 
     # Release the 35GB engine after the job unless the caller explicitly asks
-    # to keep it resident (batch rendering). The scheduler's memory budget only
-    # counts *running* jobs — a resident engine would be invisible 35GB, so
-    # unload-by-default is what keeps the budget honest (doc §31 释放 Worker).
+    # to keep it resident (batch rendering, doc §31 释放 Worker). core.py keys
+    # BOTH its resident charge (_resident_gb) and its "reuse costs 0" admission
+    # rule (_admit_next) off this module's `_engine`, so the finally below is
+    # what keeps the budget honest — never keep/clear it on any other signal.
     # close() also restores the process cwd that load() chdir'd away.
     global _engine
     with _gen_lock:

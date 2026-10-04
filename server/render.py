@@ -359,18 +359,28 @@ def _denoise_pcm(raw: bytes, alpha: float, gmin: float):
     out = np.zeros_like(sig)
     for ch in range(sig.shape[0]):
         x = sig[ch]
-        n_frames = (len(x) - n_fft) // hop + 1
+        # ceil, not floor：floor 會讓最後 (hop-1) 個樣本落在所有幀之外，輸出保持
+        # out 的初始 0 → 片尾憑空多一段數位靜音（實測 165600 樣本 = 7 ms）。
+        n_frames = -(-(len(x) - n_fft) // hop) + 1
         if n_frames < 4:
             out[ch] = x
             continue
         idx = np.arange(n_fft)[None, :] + hop * np.arange(n_frames)[:, None]
-        spec = np.fft.rfft(x[idx] * win, axis=-1).T          # (bin, frame)
+        # 末幀會讀到 x 之外（ceil 的代價）：補零到剛好覆蓋，維持幀數不變。
+        xp = np.zeros(int(idx[-1, -1]) + 1)
+        xp[:len(x)] = x
+        spec = np.fft.rfft(xp[idx] * win, axis=-1).T          # (bin, frame)
         power = np.abs(spec) ** 2
 
-        # 噪聲幀 = 幀能量低於全片中位 +15 dB；用 RMS 門檻而非音量設定，
-        # 因為 h3 的底噪隨 prompt 在 −25…−85 dB 之間跳，固定門檻會全錯。
+        # 噪聲幀 = 幀能量低於 **10 百分位 +10 dB**。
+        # 原用「中位 +15 dB」是量測陷阱第7次那條相對門檻，雙向都失效：
+        # 連續語音/音效把中位數拉高 → 真正安靜的幀反而沒被選到，而 69–85% 的幀
+        # （含語音）被標成噪聲 → 噪聲譜被語音灌高 → 語音幀整片被壓到 gmin 軌。
+        # 實測 h3 六支：語音掉 0.5–4.0 dB（docstring 寫 0.0），底噪只降 20–26 dB
+        # 且全部貼在 gmin=−26 dB 軌上 = 「整軌砍掉」而非「降噪」。
+        # p10 錨在安靜端，對 −25…−85 dB 的底噪漂移免疫（實測六支切 6–16 dB）。
         frame_db = 20 * np.log10(np.sqrt(power.sum(axis=0)) + 1e-12)
-        noise = frame_db < np.median(frame_db) + 15
+        noise = frame_db < np.percentile(frame_db, 10) + 10
         if noise.sum() < 4:
             out[ch] = x
             continue
@@ -402,7 +412,14 @@ def denoise_audio(
 
     h3 音訊的嘶聲是模型品質天花板，不是管線 bug（afftdn 只壓噪聲 4 dB 卻打掉
     語音 11.4 dB）。這裡用 power-domain Wiener subtraction：噪聲譜取自動偵測到的
-    非語音幀，實測底噪降 4.5–13.6 dB、語音只掉 0.0–0.2 dB。
+    安靜幀。
+
+    實測（~/h3_ab4 六支 h3 輸出，絕對門檻 −55 dBFS、同幀配對比較）：
+    底噪降 6–16 dB，語音掉 0.0–1.3 dB，peak 不變，5 s 片段 0.22–0.28 s。
+    ⚠️ 舊 docstring 的「7.5–13.7 dB / 語音 0.0 dB」是**量測陷阱第7次**的產物：
+    那組數字來自相對門檻（中位 +15 dB），改用絕對門檻後原實作其實把語音
+    壓掉 0.5–4.0 dB、底噪「降」20–26 dB 但全部貼在 gmin 軌（整軌砍掉）。
+    門檻已改 p10 +10 dB，見 _denoise_pcm 的註解。
 
     h3 產的 mp4 只有 t=0 一個關鍵幀，無法用 -c:v copy 切入，因此音訊必須重編、
     影片重新編碼（耗 PSNR ~43 dB）。不需要降噪時用 strip_audio() 就好。

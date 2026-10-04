@@ -188,16 +188,28 @@ _CANCELLED: set[str] = set()
 _pick_lock = threading.Lock()  # serialize admit decisions
 
 
-def _resident_gb(reg: dict) -> float:
-    """Memory held by engines/processes between jobs (invisible to the
-    per-job accounting): video keep_loaded engine, voice tts_server."""
+def _resident_gb(reg: dict, running: frozenset[str] = frozenset()) -> float:
+    """Memory held by engines/processes BETWEEN jobs (invisible to the
+    per-job accounting): video keep_loaded engine, voice tts_server.
+
+    `running` = types of in-flight jobs. A running job's own engine is already
+    charged via its MEM_GB in running_gb, so charging it again here bills the
+    box twice (video: 35+35=70 > BUDGET_GB) and budget-blocks the whole queue
+    for the life of that job — _admit_next stops at the first job that doesn't
+    fit, so one video job stalls everything behind it. Charge only what nobody
+    is holding. ponytail: keyed on job *type*; a per-worker refcount is the
+    upgrade if a second holder of the same engine ever exists (shot.py borrows
+    only video.MEM_GB as a number, never the engine).
+    """
     gb = 0.0
     video_mod = reg.get("video")
-    if video_mod is not None and getattr(video_mod, "_engine", None) is not None:
+    if (video_mod is not None and "video" not in running
+            and getattr(video_mod, "_engine", None) is not None):
         gb += video_mod.MEM_GB
     voice_mod = reg.get("voice")
     proc = getattr(voice_mod, "_proc", None) if voice_mod else None
-    if voice_mod is not None and proc is not None and proc.poll() is None:
+    if (voice_mod is not None and "voice" not in running
+            and proc is not None and proc.poll() is None):
         gb += voice_mod.MEM_GB
     llm_mod = sys.modules.get(_LLM_MODULE)  # absent => no LLM face loaded
     if llm_mod is not None and llm_mod.resident():
@@ -210,10 +222,13 @@ def _resident_gb(reg: dict) -> float:
 
 def _admit_next() -> tuple[str, dict] | None:
     reg = registry()
-    running_gb = sum(
-        (reg[r["type"]].MEM_GB if r["type"] in reg else BUDGET_GB)  # unknown => assume worst
-        for r in db().execute("SELECT type FROM jobs WHERE status='running'"))
-    running_gb += _resident_gb(reg)
+    running_rows = [r["type"] for r in
+                    db().execute("SELECT type FROM jobs WHERE status='running'")]
+    # per *job*, not per type — N concurrent concat jobs cost N GB.
+    running_gb = sum((reg[t].MEM_GB if t in reg else BUDGET_GB)  # unknown => assume worst
+                     for t in running_rows)
+    running = set(running_rows)  # membership only: who is holding an engine
+    running_gb += _resident_gb(reg, running)
     q = db().execute(
         "SELECT * FROM jobs WHERE status='queued' ORDER BY priority DESC, created_at")
     for row in q:
@@ -247,8 +262,13 @@ def _admit_next() -> tuple[str, dict] | None:
         # 引擎已驻留的同类型 job 复用常驻实例（keep_loaded 批量模式），内存增量为零；
         # 否则驻留 35GB 会被重复计费，FIFO 头部死锁（后继 job 永远进不来）。
         # video 引擎驻留的判定与 _resident_gb 同源：_engine 属性。
+        # 但引擎正被 in-flight video job 持有时不适用：那 35GB 已计入 running_gb，
+        # 不是可复用的空闲引擎——上游 finally 还会先释放它（video.py:214），
+        # 于是「零增量」实际变成重新加载。这条守卫顺带保住 video.py:34 依赖的
+        # 「调度器给 video 独占内存」不变式（漏了它会被 GPU 抢爆）。
         inc = worker.MEM_GB
-        if row["type"] == "video" and getattr(worker, "_engine", None) is not None:
+        if (row["type"] == "video" and "video" not in running
+                and getattr(worker, "_engine", None) is not None):
             inc = 0
         if running_gb + inc <= BUDGET_GB:
             return worker, _job_row(row)
