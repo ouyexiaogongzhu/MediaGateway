@@ -23,6 +23,8 @@
 | P0-5 voice 綁定資料 | ✅ 但**踩到兩個更深的斷點** | 見下方 ⚠️⚠️ |
 | 真機驗證 1–4 | ✅ **PASS（實測）** | 見下方 ✅ 區塊 |
 | 真機驗證 5 影策對白腿 | ⛔ **BLOCKED（誠實記錄）** | `character_voice_bindings` 刻意留空 |
+| **Context-IR gate** | ✅ **已撤掉硬拒**（2026-10-04） | 降級為 warning。`test_v1_videos_accepts_free_text_prompt` 釘住，負向對照有效 |
+| **編輯台詞改順序** | ✅ **已修**（2026-10-04） | `Position *int`，回歸測試 `TestCreateProjectShotKeepsPositionWhenOmitted` |
 
 **基準**：MediaGateway `pytest` 118 → **150 passed / 26s**；影策 `go build`+`vet` 乾淨，`bun test` 2034 → 2041 pass（27 fail 皆 clean HEAD 既有，stash 驗過）。
 

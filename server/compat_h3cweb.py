@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import urllib.parse
@@ -40,6 +41,7 @@ REFS_DIR = os.environ.get("H3CWEB_COMPAT_REFS_DIR",
                           os.path.join(BASE_DIR, "projects/p001/output/refs"))
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # --- H3 Context-IR prompt validation ---------------------------------------
 # Spec: ~/.claude/skills/h3-prompt-writing/references/base-en.txt
@@ -187,12 +189,21 @@ def info():
 
 @router.post("/jobs")
 def create_job(req: JobRequest):
-    # Mandatory for every h3 render. /v1/videos funnels through this function,
-    # so one check covers both routes. SDXL never gets here (it returns earlier).
+    # Advisory only — it used to hard-reject with 400, and that was wrong.
+    # 1e45880 added the reject; it silently bricked 影策's storyboard batch path
+    # (storyboard_batch.go → /v1/videos), because nothing in 影策 emits Context-IR.
+    # The composite `shot` path (main.py → core.create_job) never went through
+    # this check at all and produces good output: a dialogue-bearing shot
+    # measured -75.8 dB noise floor with r=0.999 timing alignment, on a prompt
+    # with zero Context-IR fields. So non-Context-IR prompts demonstrably work;
+    # the gate was converting a prompt-quality question into an availability
+    # outage, which is the worse trade for a one-person pipeline.
+    # The validator stays as a warning so a caller emitting malformed prompts is
+    # still visible in the log.
     error = _validate_context_ir(req.prompt,
                                  sum(1 for r in req.refs if r.kind == "image"))
     if error:
-        raise HTTPException(400, f"prompt is not valid H3 Context-IR: {error}")
+        logger.warning("prompt is not valid H3 Context-IR (allowed anyway): %s", error)
     d = req.model_dump()
     requested = d.pop("output_path")
     refs = []

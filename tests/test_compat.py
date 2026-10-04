@@ -136,9 +136,22 @@ def test_v1_videos_size_rounding(client):
     assert p["width"] == 512 and p["height"] == 288  # floored to /32
 
 
+def test_v1_videos_accepts_free_text_prompt(client):
+    """Context-IR 是警告不是拒絕（2026-10-04）。
+
+    它曾經是硬 400，而那道 gate 掐死了影策的分鏡批次路徑 —— 影策從來不產生那
+    三個欄位。複合 shot 路徑從不經過這裡卻產出正常（−75.8dB 底噪、r=0.999），
+    所以非 Context-IR prompt 確實能用。這條測試釘住「不再 400」，否則早晚有人
+    把它「修」回去。
+    """
+    r = client.post("/v1/videos", json={"prompt": "a cat on a roof at dusk"})
+    assert r.status_code == 200, r.text
+
+
 def test_v1_videos_validation(client):
     # CTX_T2VA so a 400 here can only come from the rule under test — a free-text
-    # prompt would now 400 on the Context-IR gate and pass for the wrong reason.
+    # prompt is accepted now (see test above), so every 400 below is the size/ref
+    # rule and nothing else.
     for payload, code in (
         ({"prompt": CTX_T2VA, "size": "1280×960"}, 400),   # cap 768*1344
         ({"prompt": CTX_T2VA, "size": "abc"}, 400),        # not WxH
