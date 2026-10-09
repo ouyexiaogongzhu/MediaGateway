@@ -22,16 +22,20 @@ from . import core, llm
 
 router = APIRouter()
 
-# OpenAI 兼容模型清單：影策「拉取模型目錄」與任意 OpenAI 客戶端探測用
+# 這份清單是**前端能選到的全部** —— 沒列的模型用戶根本選不到。改動前先對照
+# compat_openai 的路由條件：兩邊不一致就會出現「能跑但選不到」或「選得到但不能跑」。
+# iris 已於 2026-09-28 退役（模型目錄失蹤，route 被 qwen_image 頂替），原先仍在
+# 這裡廣告，前端會選到一個必然失敗的模型。
 _KNOWN_MODELS = [
-    "sora-2",            # video（newapi videos 協議）
-    "grok-4.7",          # chat（grok2api :8402）
-    "qwen3.8-27b",       # chat（本地 MLX）
-    "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault oQ4e-mtp 無審查）
-    "qwen3-tts",         # tts（mlx-audio）
-    "iris-image",        # image（本地 iris/sdxl）
-    "sdxl-noobai", "sdxl-realvis",  # image（本地 sdxl）
-    "qwen-image-2.1",    # image（sd.cpp Metal，GGUF）
+    "sora-2",              # video（newapi videos 協議）
+    "grok-4.7",            # chat（grok2api :8402）
+    "qwen3.8-27b",         # chat（本地 MLX）
+    "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault OQ4e-mtp 無審查）
+    "qwen3-tts",           # tts（mlx-audio）
+    "sdxl-noobai", "sdxl-realvis",  # image（本地 sdxl daemon :8187，需 daemon 在跑）
+    "qwen-image-2.1",      # image（sd.cpp Metal，Viggle v0.3 6 步蒸餾）
+    "krea2",               # image（sd.cpp Metal，Krea2 v1.1 8 步 + TAEHV；compat_openai 認名字含 krea2）
+    "qwen-image-2.1-nsfw",  # image（同引擎走 uncensored base，params["uncensored"]=True）
 ]
 
 
@@ -250,6 +254,11 @@ def chat_completions(req: ChatRequest):
         m = body.get("model") or ""
         body["model"] = _MODEL_REWRITE.get(m.lower(), m)  # 路由大小寫不敏感，重寫也必須是
         if base == OMLX_BASE:
+            # omlx 16.2GB（實測）與 video/shot(35GB)/qwen_image(26GB) 在 48GB 上互斥。
+            # 本地 qwen 分支一直有這道閘（:234），omlx 分支漏了——2026-10-10 00:12 的
+            # 分鏰生成 Metal OOM 就是它：視頻在跑時照樣拉起 16GB，51>48 直接爆。
+            if _video_running():
+                return _busy_response()
             try:
                 _ensure_omlx()  # 按需：探活失敗才 spawn（19GB 進程不常駐）
             except RuntimeError as e:

@@ -110,11 +110,28 @@ def test_stage_order_and_paths():
             assert mus.calls[0]["job_dir"] == str(jd / "music")
             kw = calls[0]
             assert Path(kw["video"]).name == "video.out"
-            # voice 餵了 ref_audio → 對白由 h3 自渲染，只鋪配樂（見 test_audio_ref_*）
-            assert [Path(t["path"]).name for t in kw["audio_tracks"]] == ["music.out"]
-            assert kw["audio_tracks"][0]["loop"] is True
-            assert kw["mute_source_audio"] is False
+            # 2026-10-04 定案：h3 音軌一律丟棄，只鋪 TTS 原聲
+            assert kw["mute_source_audio"] is True
+            assert [Path(t["path"]).name for t in kw["audio_tracks"]] == ["voice.out", "music.out"]
+            assert kw["audio_tracks"][1]["loop"] is True
             assert result["stages"]["image"]["output_path"].endswith("image.out")
+    finally:
+        restore(saved)
+
+
+def test_h3_audio_always_discarded_tts_wins():
+    """h3 生成的音軌一律丟棄，成片只鋪 TTS 原聲（使用者 2026-10-04 定案）。"""
+    img, vid, voi, mus = (Stage(kind=k) for k in ("image", "video", "voice", "music"))
+    calls = []
+    saved = patch_stages(image=img, video=vid, voice=voi, music=mus,
+                         muxRecorder=lambda **kw: calls.append(kw) or [])
+    try:
+        run_shot({"image": {"prompt": "i"}, "video": {"prompt": "v"},
+                  "voice": {"text": "t"}, "music": {"prompt": "m"}})
+        assert vid.calls[0]["params"]["refs"][-1]["kind"] == "audio", "ref_audio 仍要餵（嘴型）"
+        assert calls[0]["mute_source_audio"] is True
+        names = [Path(t["path"]).name for t in calls[0]["audio_tracks"]]
+        assert names == ["voice.out", "music.out"], names
     finally:
         restore(saved)
 
@@ -128,9 +145,9 @@ def test_audio_ref_keeps_model_track():
         run_shot({"image": {"prompt": "i"}, "video": {"prompt": "v"},
                   "voice": {"text": "t"}, "music": {"prompt": "m"}})
         assert vid.calls[0]["params"]["refs"][-1]["kind"] == "audio"
-        assert calls[0]["mute_source_audio"] is False
-        # 兩個音色念同一句＝使用者棄用的 ttsmux 變體 → TTS wav 只當 ref 不進混音
-        assert [Path(t["path"]).name for t in calls[0]["audio_tracks"]] == ["music.out"]
+        # 2026-10-04 定案：h3 音軌一律丟棄，只鋪 TTS 原聲
+        assert calls[0]["mute_source_audio"] is True
+        assert [Path(t["path"]).name for t in calls[0]["audio_tracks"]] == ["voice.out", "music.out"]
     finally:
         restore(saved)
 
@@ -143,92 +160,6 @@ def test_no_audio_ref_mutes_model_track():
     try:
         run_shot({"video": {"prompt": "v"}, "music": {"prompt": "m"}})
         assert calls[0]["mute_source_audio"] is True
-    finally:
-        restore(saved)
-
-
-def test_denoise_default_on_when_h3_track_survives():
-    """沒有 dialogue ref、也沒有其他 track → h3 自己的音軌進成品（實測 −60.0dB
-    嘶聲），這是 Wiener 收益 7.5–13.7dB 唯一成立的情境 → 預設降噪。"""
-    vid = Stage(kind="video")
-    calls, denoised = [], []
-    saved = patch_stages(
-        video=vid, muxRecorder=lambda **kw: calls.append(kw) or [],
-        denoise=lambda v, out, **kw: denoised.append((v, out)) or out)
-    try:
-        run_shot({"video": {"prompt": "v"}})
-        assert denoised and denoised[0][0].endswith("video.out"), denoised
-        got = Path(calls[0]["video"])
-        assert got.name == "video_denoised.mp4"
-        assert got.parent.name == "denoise"  # job_dir/<stage> 慣例，別撞 shot.mp4
-    finally:
-        restore(saved)
-
-
-def test_denoise_opt_out_keeps_raw_track():
-    vid = Stage(kind="video")
-    calls, denoised = [], []
-    saved = patch_stages(
-        video=vid, muxRecorder=lambda **kw: calls.append(kw) or [],
-        denoise=lambda v, out, **kw: denoised.append((v, out)) or out)
-    try:
-        run_shot({"video": {"prompt": "v"}, "mix": {"denoise": False}})
-        assert not denoised, "mix.denoise=False must skip the filter"
-        assert Path(calls[0]["video"]).name == "video.out"
-    finally:
-        restore(saved)
-
-
-def test_denoise_skipped_with_dialogue_ref():
-    """TTS wav 餵過 ref_audio → h3 自渲染的台詞已是 TTS 原檔（−86.5 vs −87.1dB），
-    濾波器量到語音 0.0dB：跑它只是白重編一次。"""
-    vid, voi, img = (Stage(kind=k) for k in ("video", "voice", "image"))
-    calls, denoised = [], []
-    saved = patch_stages(
-        image=img, video=vid, voice=voi, muxRecorder=lambda **kw: calls.append(kw) or [],
-        denoise=lambda v, out, **kw: denoised.append((v, out)) or out)
-    try:
-        run_shot({"image": {"prompt": "i"}, "video": {"prompt": "v"},
-                  "voice": {"text": "t"}})
-        assert calls[0]["mute_source_audio"] is False  # 這條路徑 h3 音軌會進成品
-        assert not denoised, "Ref2VA track is already clean — must not filter"
-        assert Path(calls[0]["video"]).name == "video.out"
-    finally:
-        restore(saved)
-
-
-def test_denoise_skipped_when_other_track_mutes_it():
-    """沒有 ref 但有配樂 → h3 音軌被 mute_source_audio 丟掉，降噪輸出沒人會聽。"""
-    vid, mus = Stage(kind="video"), Stage(kind="music")
-    calls, denoised = [], []
-    saved = patch_stages(
-        video=vid, music=mus, muxRecorder=lambda **kw: calls.append(kw) or [],
-        denoise=lambda v, out, **kw: denoised.append((v, out)) or out)
-    try:
-        run_shot({"video": {"prompt": "v"}, "music": {"prompt": "m"}})
-        assert calls[0]["mute_source_audio"] is True
-        assert not denoised, "denoised track would be muted anyway"
-    finally:
-        restore(saved)
-
-
-def test_denoise_failure_falls_back_to_raw_track():
-    """降噪是加分不是必要條件：ffmpeg 抽風不能燒掉剛燒完 GPU 的鏡頭，但必須留警告。"""
-    vid = Stage(kind="video")
-    calls = []
-
-    def boom(video, output, **kw):
-        raise RuntimeError("ffmpeg hiccup")
-
-    saved = patch_stages(video=vid, muxRecorder=lambda **kw: calls.append(kw) or [],
-                         denoise=boom)
-    try:
-        with warnings.catch_warnings(record=True) as got:
-            warnings.simplefilter("always")
-            run_shot({"video": {"prompt": "v"}})
-        assert len(calls) == 1, "mux must still run on the raw track"
-        assert Path(calls[0]["video"]).name == "video.out"
-        assert any("denoise" in str(w.message) for w in got), "no silent degradation"
     finally:
         restore(saved)
 
@@ -381,6 +312,66 @@ def test_voice_ref_without_any_visual_fails_loudly():
         assert "visual reference" in str(e), e
     else:
         raise AssertionError("expected a loud failure")
+    finally:
+        restore(saved)
+
+
+def test_dialogue_from_prompt_builds_voice_stage():
+    """prompt 帶 <d voice=…> 就自動補 voice 階段（2026-10-04：音色改走 prompt 傳輸）。
+
+    原本音色來自 character_voice_bindings，那條鏈要 asset_versions → binding →
+    shot_asset_references 三張表都通，實測三張全空 → 對白從沒真的走過 TTS。
+    """
+    img, vid, voi = (Stage(kind=k) for k in ("image", "video", "voice"))
+    calls = []
+    saved = patch_stages(image=img, video=vid, voice=voi,
+                         muxRecorder=lambda **kw: calls.append(kw) or [])
+    try:
+        run_shot({"image": {"prompt": "i"},
+                  "video": {"prompt": '她開口。<d voice="vivian">[Chinese] 我好愛你呢。</d>'}})
+        assert voi.calls[0]["params"] == {"text": "我好愛你呢。", "voice": "vivian"}
+        # ref_audio 仍然餵（嘴型要對齊），視覺參考在音訊參考之前
+        kinds = [r["kind"] for r in vid.calls[0]["params"]["refs"]]
+        assert kinds == ["image", "audio"], kinds
+        assert calls[0]["mute_source_audio"] is True
+    finally:
+        restore(saved)
+
+
+def test_prompt_without_d_does_not_add_voice_stage():
+    vid, voi = Stage(kind="video"), Stage(kind="voice")
+    muxed = []
+    saved = patch_stages(video=vid, voice=voi,
+                         muxRecorder=lambda **kw: muxed.append(kw) or [])
+    try:
+        # 純視訊、prompt 無 <d> → 不該憑空生出 voice 階段
+        run_shot({"video": {"prompt": "一個空鏡頭，沒有任何人說話。"}})
+        assert len(vid.calls) == 1
+        assert not voi.calls, "prompt 沒有 <d> 就不該跑 TTS"
+        assert muxed[0]["audio_tracks"] == []
+    finally:
+        restore(saved)
+
+
+def test_explicit_voice_param_wins_over_prompt():
+    img, vid, voi = (Stage(kind=k) for k in ("image", "video", "voice"))
+    saved = patch_stages(image=img, video=vid, voice=voi, muxRecorder=lambda **kw: None)
+    try:
+        run_shot({"image": {"prompt": "i"},
+                  "video": {"prompt": '<d voice="vivian">從 prompt</d>'},
+                  "voice": {"text": "明確指定的", "voice": "serena"}})
+        assert voi.calls[0]["params"]["text"] == "明確指定的"
+    finally:
+        restore(saved)
+
+
+def test_prompt_dialogue_without_voice_uses_default():
+    img, vid, voi = (Stage(kind=k) for k in ("image", "video", "voice"))
+    saved = patch_stages(image=img, video=vid, voice=voi, muxRecorder=lambda **kw: None)
+    try:
+        run_shot({"image": {"prompt": "i"},
+                  "video": {"prompt": "<d>[Chinese] 沒有指定音色。</d>"}})
+        assert voi.calls[0]["params"] == {"text": "沒有指定音色。"}
     finally:
         restore(saved)
 

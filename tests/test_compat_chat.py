@@ -309,3 +309,38 @@ if __name__ == "__main__":
         t()
         print(f"PASS {t.__name__}")
     print(f"\n{len(tests)} tests passed")
+
+
+def test_omlx_branch_rejects_while_video_running():
+    """omlx(uncensored) 分支必須與本地 qwen 分支同樣讓路。
+
+    2026-10-10 00:12 分鏰生成 Metal OOM：本地 qwen 分支有 _video_running() 閘、
+    omlx 分支漏了——視頻(35GB)在跑時照樣拉起 16.2GB，51>48 爆。
+    """
+    from server import compat_chat as cc
+
+    calls = {"n": 0}
+
+    class _Row(dict):
+        pass
+
+    def fake_db():
+        class _DB:
+            def execute(self, *a, **k):
+                calls["n"] += 1
+                class _R:
+                    def fetchall(self):
+                        return [{"1": 1}]  # 有 heavy job 在跑
+                return _R()
+        return _DB()
+
+    orig_db = cc.core.db
+    cc.core.db = fake_db
+    try:
+        req = cc.ChatRequest(model="qwen3.8-uncensored",
+                             messages=[cc.ChatMessage(role="user", content="x")])
+        resp = cc.chat_completions(req)
+        assert resp.status_code == 503, resp.status_code
+        assert calls["n"] >= 1
+    finally:
+        cc.core.db = orig_db

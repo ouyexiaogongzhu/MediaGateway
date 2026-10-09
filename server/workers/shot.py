@@ -8,7 +8,7 @@ params (every stage optional, but at least one required):
     image: {prompt, width?, height?, steps?, seed?, input?}
     video: {prompt, seconds?, steps?, seed?, first_frame?="auto"|path,
             last_frame?, refs?[], ...}   # "auto" = use generated image
-    voice: {text, voice|prompt_wav+prompt_text, speed?}
+    voice: {text, voice|speaker, speed?}  # 省略時由 video.prompt 的 <d voice=…> 補
     music: {prompt, duration_s?, seed?, lyrics?}
     sfx:   ["ambience_rain"] | [{sfx_tag|"path", start?, loop?, volume?}]
            # 擬音不是階段：sfx_tag 由 mix._pick_sfx 解析成一個檔案，只在 mux 段生效
@@ -18,7 +18,7 @@ Final output: job_dir/shot.mp4 (skipped if no video stage).
 """
 from __future__ import annotations
 
-import warnings
+import re
 from pathlib import Path
 
 from .. import render
@@ -34,7 +34,46 @@ MEM_GB = video_w.MEM_GB  # peak stage
 _STAGE_WEIGHTS = {"image": 1, "video": 4, "voice": 1, "music": 1}
 
 
+# prompt 內的對白：<d voice="vivian">[Chinese] 台詞</d>
+# 為什麼走 prompt 而不是資料庫：原本的音色來自 character_voice_bindings，而那條鏈要
+# asset_versions → binding → shot_asset_references 三張表都通；實測三張全空，所以
+# 對白從來沒有真的走過 TTS。prompt 早就在傳了（h3 本來就讀 <d>），從裡面取出台詞
+# 與 speaker 可以完全繞開那條斷鏈。voice= 可省略，省略時用 tts_qwen 的預設音色。
+_DIALOGUE_RE = re.compile(
+    r"<d\s*(?:voice=[\"']?([^\"'>\s]+)[\"']?)?\s*>(.*?)</d>", re.S | re.I)
+_LANG_TAG_RE = re.compile(r"^\s*\[[A-Za-z-]+\]\s*")
+
+
+def dialogue_from_prompt(prompt: str) -> dict | None:
+    """從 prompt 抽出台詞 → TTS 參數。沒有 <d> 回 None。
+
+    回傳 {"text": ..., "voice": ...}；voice 可能是 None（交給 worker 預設）。
+    多段 <d> 依序串接 —— 那是連續發話，h3 也照順序念。
+    """
+    if not prompt or "<d" not in prompt.lower():
+        return None
+    texts, voice = [], None
+    for raw_voice, body in _DIALOGUE_RE.findall(prompt):
+        line = _LANG_TAG_RE.sub("", body).strip()
+        if line:
+            texts.append(line)
+        if voice is None and raw_voice:
+            voice = raw_voice.strip()
+    if not texts:
+        return None
+    spec = {"text": " ".join(texts)}
+    if voice:
+        spec["voice"] = voice
+    return spec
+
+
 def run(params: dict, job_dir: Path, progress, cancel) -> dict:
+    params = dict(params)
+    # prompt 帶 <d> 就自動補一個 voice 階段（呼叫端沒顯式給 voice 時）。
+    if not params.get("voice") and params.get("video"):
+        spec = dialogue_from_prompt((params["video"] or {}).get("prompt") or "")
+        if spec:
+            params["voice"] = spec
     enabled = [s for s in ("image", "video", "voice", "music") if params.get(s)]
     if not enabled:
         raise ValueError("at least one of image/video/voice/music is required")
@@ -121,41 +160,28 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
                 "note": "no video stage — returning first stage output"}
 
     tracks = []
-    # TTS wav 有兩種去處：餵給 h3 當 ref_audio（此時 h3 自渲染的音軌就是台詞，
-    # 實測底噪 −86.5dB / 時間對齊 r=0.912），或直接鋪進混音。兩者只能選一條——
-    # 同時鋪會是兩個音色念同一句（使用者判「不符合要求」已棄用的 ttsmux 變體）。
-    if "voice" in outputs and not video_audio_ref:
+    # h3 生成的音軌一律丟棄，成片只鋪 TTS 原聲（2026-10-04 使用者定案）。
+    # 但 ref_audio 仍然要餵：它不是為了拿聲音，是為了讓 h3 知道台詞、嘴型對齊。
+    # 實測對照（512×288 / 4.46s / 同一支 prompt）：
+    #   帶 ref-audio → h3 音軌底噪 −75.8dB、時間對齊 r=0.999；無 → −60.0dB。
+    # 音軌本身不用，只留它的「表演」。
+    if "voice" in outputs:
         tracks.append({"path": outputs["voice"]["output_path"], "start": 0})
     if "music" in outputs:  # bed track → mux's music_volume default, loops to video length
         tracks.append({"path": outputs["music"]["output_path"], "loop": True})
     tracks += sfx_tracks  # 擬音鋪最後，音量走 mix.sfx_volume（預設比對白輕）
 
-    # 降噪（power-domain Wiener：實測底噪降 6–16dB、語音 0.0–1.3dB）只補一個洞。
-    # 舊註解的「7.5–13.7dB、語音 0.0dB」是相對門檻量出來的假數字——絕對門檻
-    # (−55dBFS, hiss.py) 重測原實作其實語音掉 0.5–4.0dB，門檻已修（見 render.py）。
-    # h3 自渲染的音軌只有「沒被 dialogue ref 洗成 TTS 原檔（實測 −86.5dB）」且
-    # 「沒被 tracks 墊掉（mute_source_audio）」時才會進成品，那條路徑底噪 −60.0dB。
-    # 其餘兩條要嘛已經乾淨、要嘛根本不進成品——跑降噪只是白重編一次 libx264。
-    video_in = vid["output_path"]
-    if mix.get("denoise", True) and not video_audio_ref and not tracks:
-        den_dir = job_dir / "denoise"
-        den_dir.mkdir(parents=True, exist_ok=True)
-        clean = str(den_dir / "video_denoised.mp4")
-        try:
-            render.denoise_audio(video_in, clean, timeout=float(mix.get("timeout", 600)))
-            video_in = clean
-        except Exception as e:
-            # 降噪是加分不是必要條件：ffmpeg 抽風不該燒掉剛燒完 GPU 的整顆鏡頭。
-            # 退回原軌（嘶聲回來但影片還在），偏差寫 stderr 而不是讓整個 job 死掉。
-            warnings.warn(f"denoise_audio failed ({e}); shipping un-denoised track",
-                          stacklevel=2)
+    # 這裡曾經對 h3 的音軌做 Wiener 降噪（power-domain，實測降 7.5–13.7dB）。
+    # h3 音軌改成一律丟棄之後它就是死碼了：render.mux 在 mute_source_audio=True
+    # 時用 anullsrc 當混音底，被降噪的那條軌根本不會進成品。函式本身留在
+    # render.py（仍有測試），只是不再由 shot worker 呼叫。
 
     final = str(job_dir / "shot.mp4")
     render.mux(
-        video=video_in, audio_tracks=tracks, output=final,
-        # refs 帶 audio 時 h3 自渲染的音軌是乾淨的（實測 −86.5dB vs 無 ref 的
-        # −60.0dB）→ 保留；舊註解「h3 不再出音轨」前提已過期，照舊會丟掉 Ref2VA 的成果
-        mute_source_audio=bool(tracks) and not video_audio_ref,
+        video=vid["output_path"], audio_tracks=tracks, output=final,
+        # 一律丟棄 h3 自渲染的音軌（使用者 2026-10-04 定案：只用 TTS 的聲音）。
+        # 注意這跟 video_audio_ref 無關 —— ref_audio 仍然餵，嘴型要對齊。
+        mute_source_audio=True,
         subtitles=mix.get("subtitles"),
         dialogue_volume=float(mix.get("dialogue_volume", 1.0)),
         music_volume=float(mix.get("music_volume", 0.15)),
