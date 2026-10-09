@@ -188,9 +188,25 @@ def _route(model):
     return None, None
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str = "{}"
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    # 工具循环（影策导演台 director-turn）需要完整往返：assistant 的 tool_calls
+    # 与 tool 消息的 tool_call_id/name 必须透传，否则多轮历史回放被洗掉。
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -200,6 +216,8 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     enable_thinking: Optional[bool] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[object] = None
 
 
 def _upstream_error(message: str, status: int = 502) -> JSONResponse:
@@ -231,6 +249,9 @@ def chat_completions(req: ChatRequest):
     if base is None:
         # 本地 qwen MLX：按需拉起 + 内存互斥（19GB LLM 与 35GB 视频引擎互斥）
         body["model"] = _local_key(req.model)  # 轉發名與常駐服務一致（qwen3.6 等舊名回退 3.8）
+        # MLX 不支持工具调用：剥掉工具字段，防止上游被未知字段带偏（分鏰流不送 tools，不受影响）
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
         if _video_running():
             return _busy_response()
         try:
@@ -254,6 +275,9 @@ def chat_completions(req: ChatRequest):
         m = body.get("model") or ""
         body["model"] = _MODEL_REWRITE.get(m.lower(), m)  # 路由大小寫不敏感，重寫也必須是
         if base == OMLX_BASE:
+            # omlx 同样不认工具字段，剥掉（grok 分支原样透传）。
+            body.pop("tools", None)
+            body.pop("tool_choice", None)
             # omlx 16.2GB（實測）與 video/shot(35GB)/qwen_image(26GB) 在 48GB 上互斥。
             # 本地 qwen 分支一直有這道閘（:234），omlx 分支漏了——2026-10-10 00:12 的
             # 分鏰生成 Metal OOM 就是它：視頻在跑時照樣拉起 16GB，51>48 直接爆。

@@ -344,3 +344,53 @@ def test_omlx_branch_rejects_while_video_running():
         assert calls["n"] >= 1
     finally:
         cc.core.db = orig_db
+
+
+def test_chat_forwards_tools_and_tool_history_to_provider():
+    """导演台 director-turn 契约：grok 等供应商路由必须透传 tools 与工具消息历史。
+
+    ChatRequest 此前没有 tools 字段，pydantic 静默剥掉 → 模型永远看不到工具定义，
+    只会回散文（2026-10-10 E2E 实录 rounds=0）。
+    """
+    tools = [{"type": "function", "function": {"name": "editDocument", "parameters": {"type": "object"}}}]
+    Stub.hits = 0
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    old_providers = compat_chat._PROVIDERS
+    compat_chat._PROVIDERS = [("grok", f"http://127.0.0.1:{srv.server_address[1]}", "")]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "grok-chat-fast",
+            "messages": [
+                {"role": "user", "content": "女人偶坐在床边"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "editDocument", "arguments": "{\"operations\":[]}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "name": "editDocument", "content": '{"applied":1}'},
+            ],
+            "tools": tools,
+        })
+        assert r.status_code == 200, r.text
+        assert Stub.hits == 1
+        body = Stub.last_body
+        assert body["tools"] == tools, "tools 被网关剥掉"
+        assert body["messages"][1]["tool_calls"][0]["function"]["name"] == "editDocument"
+        assert body["messages"][2]["tool_call_id"] == "c1"
+    finally:
+        compat_chat._PROVIDERS = old_providers
+        srv.shutdown()
+
+
+def test_chat_strips_tools_for_local_qwen():
+    """本地 MLX 不认工具字段：剥掉，分鏰流（从不送 tools）不受影响。"""
+
+    def go():
+        r = client.post("/v1/chat/completions", json={
+            "model": "qwen3.8-27b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]})
+        assert r.status_code == 200, r.text
+        assert "tools" not in Stub.last_body
+        assert "tool_choice" not in Stub.last_body
+    with_stub(go)
