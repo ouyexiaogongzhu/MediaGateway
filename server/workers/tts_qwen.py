@@ -3,7 +3,7 @@
 Model: mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16 (predefined speakers,
 emotion instruct). Voice cloning needs the Base variant + ref_audio/ref_text.
 Env overrides: MLXAUDIO_DIR, MLXAUDIO_PYTHON (venv python), MLXAUDIO_BIN
-(full command override, used by tests), MLXAUDIO_MODEL.
+(full command override, used by tests), MLXAUDIO_MODEL, MLXAUDIO_MODEL_YUE.
 """
 from __future__ import annotations
 
@@ -19,6 +19,10 @@ DEFAULT_DIR = os.environ.get("MLXAUDIO_DIR", "/Users/vincent/tool/mlx-audio")
 DEFAULT_PYTHON = os.path.join(DEFAULT_DIR, ".venv/bin/python")
 DEFAULT_MODEL = os.environ.get(
     "MLXAUDIO_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16")
+# 粵語專用：原版+LoRA 合併模型（jmtl/hk-cantonese-cc0）。此 LoRA 毀中日韓，
+# 必須按 lang=yue 路由，不能當預設。
+YUE_MODEL = os.environ.get(
+    "MLXAUDIO_MODEL_YUE", "/Users/vincent/tool/tts-models/hk-cantonese-mlx")
 DEFAULT_TIMEOUT = 600.0
 # CustomVoice models require a speaker; plugin coalesces voice->model key, so
 # callers often send none. Options: serena vivian uncle_fu ryan aiden ono_anna
@@ -42,6 +46,15 @@ def _wav_rate(path: Path):
     return None
 
 
+def _model_for(params: dict) -> str:
+    """params.model > lang=yue → 粵語合併模型 > env > 預設。"""
+    if params.get("model"):
+        return str(params["model"])
+    if params.get("lang") == "yue":
+        return YUE_MODEL
+    return os.environ.get("MLXAUDIO_MODEL", DEFAULT_MODEL)
+
+
 def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
@@ -49,7 +62,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     timeout = float(params.get("timeout", DEFAULT_TIMEOUT))
 
     args = [
-        "--model", os.environ.get("MLXAUDIO_MODEL", DEFAULT_MODEL),
+        "--model", _model_for(params),
         "--text", text,
         "--output_path", str(job_dir),
         "--file_prefix", "output",

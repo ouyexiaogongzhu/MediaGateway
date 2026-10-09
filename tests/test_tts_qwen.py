@@ -72,6 +72,40 @@ def test_tts_qwen_builds_command_and_finds_output():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
+def test_tts_qwen_model_routing():
+    """params.model > lang=yue → YUE_MODEL > env MLXAUDIO_MODEL（粵語 LoRA 投產）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = _stub(tmp)
+        saved = {k: os.environ.get(k) for k in
+                 ("MLXAUDIO_BIN", "MLXAUDIO_MODEL", "STUB_ARGV")}
+        saved_yue = tts_qwen.YUE_MODEL
+        os.environ["MLXAUDIO_BIN"] = stub
+        os.environ["MLXAUDIO_MODEL"] = "fake/qwen-tts"
+        os.environ["STUB_ARGV"] = str(Path(tmp) / "argv.json")
+        try:
+            job_dir = Path(tmp) / "job"
+            job_dir.mkdir()
+
+            def run_args(params):
+                tts_qwen.run(params, job_dir, lambda *a: None, lambda: False)
+                return json.loads((Path(tmp) / "argv.json").read_text())
+
+            # params.model 壓過 env
+            args = run_args({"text": "x", "model": "fake/explicit"})
+            assert args[args.index("--model") + 1] == "fake/explicit"
+            # lang=yue → 粵語合併模型，env 不搶
+            tts_qwen.YUE_MODEL = "/fake/hk-cantonese-mlx"
+            args = run_args({"text": "x", "lang": "yue"})
+            assert args[args.index("--model") + 1] == "/fake/hk-cantonese-mlx"
+            # 無 model 無 lang → env 預設（原版模型，保中日韓）
+            args = run_args({"text": "x"})
+            assert args[args.index("--model") + 1] == "fake/qwen-tts"
+        finally:
+            tts_qwen.YUE_MODEL = saved_yue
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
 def test_tts_qwen_errors():
     with tempfile.TemporaryDirectory() as tmp:
         stub = _stub(tmp)

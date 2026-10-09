@@ -41,19 +41,25 @@ _STAGE_WEIGHTS = {"image": 1, "video": 4, "voice": 1, "music": 1}
 # 與 speaker 可以完全繞開那條斷鏈。voice= 可省略，省略時用 tts_qwen 的預設音色。
 _DIALOGUE_RE = re.compile(
     r"<d\s*(?:voice=[\"']?([^\"'>\s]+)[\"']?)?\s*>(.*?)</d>", re.S | re.I)
-_LANG_TAG_RE = re.compile(r"^\s*\[[A-Za-z-]+\]\s*")
+_LANG_TAG_RE = re.compile(r"^\s*\[([A-Za-z-]+|粵語)\]\s*")
+_YUE_TAGS = frozenset({"cantonese", "yue", "粵語"})
 
 
 def dialogue_from_prompt(prompt: str) -> dict | None:
     """從 prompt 抽出台詞 → TTS 參數。沒有 <d> 回 None。
 
     回傳 {"text": ..., "voice": ...}；voice 可能是 None（交給 worker 預設）。
+    [Cantonese]/[粵語]/[yue] 標籤捕獲成 spec["lang"]="yue"（tts_qwen 路由到
+    粵語合併模型），其餘語言標籤照舊只剝除。
     多段 <d> 依序串接 —— 那是連續發話，h3 也照順序念。
     """
     if not prompt or "<d" not in prompt.lower():
         return None
-    texts, voice = [], None
+    texts, voice, lang = [], None, None
     for raw_voice, body in _DIALOGUE_RE.findall(prompt):
+        m = _LANG_TAG_RE.match(body)
+        if m and m.group(1).lower() in _YUE_TAGS:
+            lang = "yue"
         line = _LANG_TAG_RE.sub("", body).strip()
         if line:
             texts.append(line)
@@ -64,6 +70,8 @@ def dialogue_from_prompt(prompt: str) -> dict | None:
     spec = {"text": " ".join(texts)}
     if voice:
         spec["voice"] = voice
+    if lang:
+        spec["lang"] = lang
     return spec
 
 

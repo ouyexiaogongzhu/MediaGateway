@@ -338,6 +338,18 @@ def test_dialogue_from_prompt_builds_voice_stage():
         restore(saved)
 
 
+def test_dialogue_lang_tag_yue():
+    """[Cantonese]/[粵語]/[yue] 捕獲成 spec.lang=yue（路由粵語模型）；其他標籤照舊剝除。"""
+    assert shot.dialogue_from_prompt('<d>[Cantonese] 今晚食咩餸？</d>') == {
+        "text": "今晚食咩餸？", "lang": "yue"}
+    assert shot.dialogue_from_prompt('<d voice="vivian">[粵語] 你好嗎？</d>') == {
+        "text": "你好嗎？", "voice": "vivian", "lang": "yue"}
+    assert shot.dialogue_from_prompt('<d>[Yue] 得閒飲茶</d>')["lang"] == "yue"
+    # 非粵語標籤只剝除，不帶 lang
+    assert shot.dialogue_from_prompt('<d>[Chinese] 你吃什麼？</d>') == {
+        "text": "你吃什麼？"}
+
+
 def test_prompt_without_d_does_not_add_voice_stage():
     vid, voi = Stage(kind="video"), Stage(kind="voice")
     muxed = []
