@@ -83,7 +83,11 @@ def _validate_context_ir(prompt: str, image_refs: int) -> Optional[str]:
     if all(p >= 0 for p in positions) and positions != sorted(positions):
         problems.append("fields out of order: expected " + " -> ".join(CTX_FIELDS))
 
-    if image_refs == 1 and not prompt.startswith(CTX_I2VA_PREAMBLE + "\n\n"):
+    # CRLF line endings and a trailing space after the line are transport
+    # noise, not paraphrase — only the wording itself is verbatim-checked.
+    normalized = prompt.replace("\r\n", "\n")
+    if image_refs == 1 and not re.match(
+            re.escape(CTX_I2VA_PREAMBLE) + r"[ \t]?\n\n", normalized):
         problems.append("I2VA prompts must open with the verbatim line "
                         f"{CTX_I2VA_PREAMBLE!r} followed by a blank line")
 

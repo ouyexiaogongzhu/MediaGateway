@@ -142,5 +142,38 @@ def main():
     print("\nall prompt-format rules hold")
 
 
+# --- regression: the three real-shaped storyboard prompts (2026-10-10) ------
+# The gate itself no longer rejects (it logs a warning since 68db6ea), but these
+# pin that the validator does not false-positive on valid input either — the
+# warning text is what callers read to fix their prompts.
+
+def test_regression_conforming_i2va_with_dialogue():
+    assert err(GOOD_I2VA, refs=1) is None
+
+
+def test_regression_preamble_trailing_space_accepted():
+    e = err(GOOD_I2VA.replace("fully referenced.\n\n", "fully referenced. \n\n"), refs=1)
+    assert e is None
+
+
+def test_regression_crlf_line_endings_accepted():
+    e = err(GOOD_I2VA.replace("\n", "\r\n"), refs=1)
+    assert e is None
+
+
+def test_regression_t2va_prose_mentioning_picture_ref():
+    prose = ("integrated_multimodal_description: [Shot 1] A rainy alley at night, "
+             "evoking <Picture 1> from the storyboard. A calm male voice (S1) says "
+             "in an off-screen voiceover: <d>[Chinese] 你是誰？</d>\n\n"
+             "overall_soundscape: Steady rain beneath a low ventilation hum.\n\n"
+             "non_diegetic_music: N/A")
+    assert err(prose, refs=0) is None
+
+
+def test_regression_dialogue_in_soundscape_stays_flagged():
+    e = err(DIALOGUE_IN_SOUNDSCAPE, refs=1)
+    assert e and "overall_soundscape" in e
+
+
 if __name__ == "__main__":
     main()

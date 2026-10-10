@@ -13,16 +13,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# isolate env BEFORE importing server.* (core binds DB/ASSET_ROOT at import)
+# isolate env BEFORE importing server.* (core binds DB/ASSET_ROOT at import).
+# setdefault, then re-derive _TMP: when pytest runs several env-isolating test
+# files in one process, the first importer's values are already baked into the
+# bound server modules — overwriting the env here would strand the fixture
+# files below in a directory the app no longer reads (the 404/400 pair).
 _TMP = tempfile.mkdtemp(prefix="mg_compat_test_")
-os.environ["MG_DB"] = os.path.join(_TMP, "gateway.db")
-os.environ["MG_ASSETS"] = os.path.join(_TMP, "assets")
-os.environ["H3CWEB_COMPAT_BASE_DIR"] = _TMP
-os.environ["H3CWEB_COMPAT_OUT_DIR"] = os.path.join(_TMP, "shots")
-os.environ["H3CWEB_COMPAT_REFS_DIR"] = os.path.join(_TMP, "refs")
+os.environ.setdefault("MG_DB", os.path.join(_TMP, "gateway.db"))
+os.environ.setdefault("MG_ASSETS", os.path.join(_TMP, "assets"))
+os.environ.setdefault("H3CWEB_COMPAT_BASE_DIR", _TMP)
+os.environ.setdefault("H3CWEB_COMPAT_OUT_DIR", os.path.join(_TMP, "shots"))
+os.environ.setdefault("H3CWEB_COMPAT_REFS_DIR", os.path.join(_TMP, "refs"))
 # dead LLM port: the scheduler's video mutex must never see (or kill) the real
 # local qwen server on :8000 from inside a test run
-os.environ["QWEN_PORT"] = "8899"
+os.environ.setdefault("QWEN_PORT", "8899")
+_TMP = os.environ["H3CWEB_COMPAT_BASE_DIR"]
 for d in ("assets", "shots", "refs"):
     os.makedirs(os.path.join(_TMP, d), exist_ok=True)
 Path(_TMP, "shots", "legacy.mp4").write_bytes(b"LEGACY")
