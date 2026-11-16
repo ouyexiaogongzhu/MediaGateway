@@ -57,7 +57,7 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def run_cli(cmd: list[str], *, cwd: str, log_path: os.PathLike, env: dict | None,
-            timeout: float, cancel, engine: str) -> None:
+            timeout: float, cancel, engine: str, on_log=None) -> None:
     """Run cmd in its own session, output streamed to log_path; raise with the
     log tail on failure or timeout, on cancellation kill the group and raise.
 
@@ -66,6 +66,7 @@ def run_cli(cmd: list[str], *, cwd: str, log_path: os.PathLike, env: dict | None
     """
     if cancel():
         raise Exception("cancelled")
+    offset = 0
     with open(log_path, "w") as log:  # context manager: closed even on raise
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
                                 env=env, start_new_session=True)
@@ -75,6 +76,18 @@ def run_cli(cmd: list[str], *, cwd: str, log_path: os.PathLike, env: dict | None
                 proc.wait(timeout=2)  # poll cancel() mid-run; SIGKILL needs no grace
                 break
             except subprocess.TimeoutExpired:
+                if on_log:  # feed newly appended log bytes (prealloc-safe: track offset)
+                    try:
+                        size = os.path.getsize(log_path)
+                        if size < offset:
+                            offset = 0
+                        if size > offset:
+                            with open(log_path, errors="replace") as f:
+                                f.seek(offset)
+                                on_log(f.read())
+                            offset = size
+                    except OSError:
+                        pass
                 if cancel():
                     _kill(proc)
                     raise Exception("cancelled") from None

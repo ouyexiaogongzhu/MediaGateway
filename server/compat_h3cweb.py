@@ -152,6 +152,8 @@ class JobRequest(BaseModel):
     first_frame: Optional[str] = None
     last_frame: Optional[str] = None
     keep_loaded: bool = False
+    # video 引擎選擇：缺省 mmh3（2026-11-15 起，4.0× 於 h3.c）；"h3c" 走舊 h3.c 回退
+    engine: Optional[str] = None
     mute_audio: bool = False
 
 
@@ -220,7 +222,9 @@ def create_job(req: JobRequest):
     d["refs"] = refs
     if requested:
         d["requested_output_path"] = _resolve(requested)
-    job = core.create_job("video", d)
+    # video 引擎：缺省 mmh3（CLI spawn，--vram-budget 40 必帶由 worker 內硬編）；
+    # engine="h3c" 走舊 h3.c ctypes 引擎回退。兩者同模型權重族，prompt 通用。
+    job = core.create_job("mmh3" if d.pop("engine", None) != "h3c" else "video", d)
     out = {"job_id": job["id"], "status": "queued",
            "output_path": _product_path(job["id"])}
     if requested:

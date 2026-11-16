@@ -1,7 +1,7 @@
 """Shot composite worker: image → video → voice → music → ffmpeg mux.
 
 Orchestrates the other workers in-process, sequentially, inside one job.
-The scheduler sees MEM_GB = max stage (video, 35GB) so a shot render holds
+The scheduler sees MEM_GB = max stage (video, 20GB) so a shot render holds
 the GPU exclusively for its whole duration — stages never overlap.
 
 params (every stage optional, but at least one required):
@@ -25,7 +25,7 @@ from .. import render
 from . import qwen_image as image_w  # iris 退役後改接 Qwen-Image-2.1（參數同構：prompt/width/height）
 from . import mix as mix_w  # 擬音：複用 mix._pick_sfx 的 sfx_tag 解析器
 from . import music as music_w
-from . import video as video_w
+from . import mmh3 as video_w
 from . import voice as voice_w
 
 TYPE = "shot"
