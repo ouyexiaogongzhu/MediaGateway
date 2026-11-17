@@ -65,6 +65,8 @@ class ShotIn(BaseModel):
 @app.on_event("startup")
 def _startup():
     core.registry()  # fail fast on broken worker modules
+    from .compat_chat import kill_orphan_omlx
+    kill_orphan_omlx()  # kickstart 存活的無主 omlx（佔 :8082+16GB，watchdog 殺不到）
     threading.Thread(target=core.scheduler_loop, daemon=True).start()
 
 

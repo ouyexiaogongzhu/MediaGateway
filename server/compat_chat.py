@@ -11,6 +11,7 @@ import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter
@@ -132,6 +133,44 @@ def _omlx_watchdog():
             except Exception:
                 pass
         print(f"[compat_chat] omlx exited (idle/unload → 用完即关)", flush=True)
+
+
+def kill_orphan_omlx() -> None:
+    """重啟後清掉上一個 gateway 拉起、現已無主的 omlx。
+
+    omlx 以 start_new_session=True spawn（脫離進程組），gateway 被 kickstart
+    時它不會死；新 gateway 的 _omlx_proc 是 None → watchdog 永遠不會殺它 →
+    佔住 :8082（與 16GB）但無人管理，idle-exit 失效。掃 ps 全表找 argv0 是
+    omlx binary 的進程（不用 lsof：plist PATH 沒有 /usr/sbin；只認 argv0
+    而非整行子串——整行匹配會自殺：任何 mention 這些詞的 shell 都中）。
+    實測 omlx-server 無視 SIGTERM，等 3 秒還活著就 SIGKILL。"""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,command="],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001 — ps 失敗就不清理，別擋啟動
+        return
+    me = os.getpid()
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid, cmd = parts
+        argv0 = cmd.split()[0] if cmd.split() else ""
+        if "omlx" not in Path(argv0).name or int(pid) == me:
+            continue
+        try:
+            os.kill(int(pid), 15)  # SIGTERM
+            for _ in range(6):  # 3s 內每 0.5s 查一次
+                time.sleep(0.5)
+                alive = subprocess.run(["/bin/ps", "-p", pid],
+                                       capture_output=True, text=True).returncode == 0
+                if not alive:
+                    break
+            else:
+                os.kill(int(pid), 9)  # SIGKILL
+            print(f"[compat_chat] killed orphan omlx pid={pid}", flush=True)
+        except (ValueError, ProcessLookupError, PermissionError):
+            continue
 
 
 def _ensure_omlx():

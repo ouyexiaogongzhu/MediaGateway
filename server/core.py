@@ -235,11 +235,16 @@ def _admit_next() -> tuple[str, dict] | None:
                 mod = sys.modules.get(mod_name)
                 if mod is None:
                     continue
+                why = None
                 if getattr(mod, "busy", lambda: False)():
-                    blocked = True
-                    break
-                if getattr(mod, "resident", lambda: False)():
+                    why = "chat busy"
+                elif getattr(mod, "resident", lambda: False)():
                     getattr(mod, "request_unload", lambda: None)()
+                    why = "chat resident"
+                if why:
+                    # 讓 /jobs/{id} 的 phase 直接回答「為什麼不跑」——互斥閘卡死
+                    #（如流式 chat 中斷後 busy 計數不歸零）肉眼可診
+                    _update(row["id"], phase=f"waiting: {why} ({mod_name.rsplit('.', 1)[-1]})")
                     blocked = True
                     break
             if blocked:
