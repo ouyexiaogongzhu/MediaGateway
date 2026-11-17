@@ -74,6 +74,16 @@
 | PDMD 2步 / TaoMate 3步 LoRA | DiT 時間可能再砍半，畫質待驗 |
 | Ref2VA（--reference-audio/video） | 對白克隆路徑，對應 h3.c 的 --ref-audio |
 
+## 7b. ⛔ 1080 級 dense = 本機不可行（OOM×2 實錘，2026-11-17）
+
+`1024×1792/124f + --attention dense` 連續兩次把機器搞到強制重啟（reboot 11:00 / 11:15，無 panic/jetsam 報告留存 = 記憶體極端飢餓下的凍結）。崩潰前捕到 step1=422.6s、step2=398.5s。
+
+**根因：`--vram-budget` 只約束權重駐留，不管 dense attention 的瞬態 scratch。** 1024×1792/124f 的 dense attention 激活 ~4× 於 720p，加上 IDE/桌面常駐，直接撞穿物理 RAM。第一次矩陣跑（箱子較空）曾成功（DiT 1790.6s = VSA 的 2.6× 慢），重跑兩次全崩。
+
+**結論：1080 級只能 VSA（695.4s DiT ≈ 11.6 分），dense 在本機是 720p 級以下的專利。不要跑第三次。**
+
+樣本存活：`~/tool/mmh3/samples/sp_1080_{vsa,dense}.mp4`（dense 版是崩潰前成功那輪的產物）。
+
 ## 8. 產物與復現
 
 ```bash
