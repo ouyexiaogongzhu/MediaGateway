@@ -104,14 +104,14 @@ def test_mmh3_ref2va_cmd_shape(tmp_path):
     mmh3.MODELS_ROOT = tmp_path
     try:
         res = mmh3.run({"prompt": "dancing", "width": 768, "height": 1344,
-                        "frames": 120, "seed": 3,
+                        "frames": 120, "seed": 3, "steps": 4,  # API 層塞進來的預設
                         "refs": [{"kind": "image", "path": str(ref)},
                                  {"kind": "image", "path": str(ref)}]},
                        tmp_path, lambda *a: None, lambda: False)
         cmd = captured["cmd"]
         assert cmd.count("--reference") == 2
         assert mmh3.REF2VA_TURBO in cmd and cmd[cmd.index("--lora") + 1] == mmh3.REF2VA_TURBO
-        assert cmd[cmd.index("--steps") + 1] == "8"          # turbo 蒸餾步數覆蓋缺省 4
+        assert cmd[cmd.index("--steps") + 1] == "8"          # turbo 蒸餾步數強制（API 預設 4 不可信）
         assert "--patch" not in cmd                          # FastH3 patch 是 fl2va 的
         assert cmd[cmd.index("--shift-video") + 1] == "6"
         assert cmd[cmd.index("--attention") + 1] == "sol"

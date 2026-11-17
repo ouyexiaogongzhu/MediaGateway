@@ -68,8 +68,8 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         frames = max(1, round(float(params["seconds"]) * 24))
     else:
         frames = number(params, "frames", 124, 5, 3600, int)
-    if ref2va and "steps" not in params:
-        steps = 8  # Turbo LoRA 蒸餾步數
+    if ref2va:
+        steps = 8  # Turbo LoRA 蒸餾配方；JobRequest 預設 4 會被 API 層塞進 params，不可信
     else:
         steps = number(params, "steps", 4, 1, 50, int)
     seed = seed_of(params, 0)
@@ -100,8 +100,9 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
                 "--latent-upscaler", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"]
 
     log = Path(job_dir) / "generate.log"
-    # 幀數線性：362f 實測 581s。 上限寬鬆，run_cli 內部已有 2s 取消輪詢。
-    timeout = 600 + int(frames) * 1.5
+    # 幀數線性：T2VA 4步 362f 實測 581s；ref2va turbo 8步 120f 走到解碼就要 ~800s。
+    # 上限寬鬆，run_cli 內部已有 2s 取消輪詢。
+    timeout = 900 + int(frames) * 3 if ref2va else 600 + int(frames) * 1.5
 
     step_re = re.compile(r"step (\d+)/(\d+)")
     done_flags = {"decoded and submitted": 0.9, "decoded the audio": 0.95}
