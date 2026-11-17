@@ -24,18 +24,13 @@ router = APIRouter()
 
 # 這份清單是**前端能選到的全部** —— 沒列的模型用戶根本選不到。改動前先對照
 # compat_openai 的路由條件：兩邊不一致就會出現「能跑但選不到」或「選得到但不能跑」。
-# iris 已於 2026-09-28 退役（模型目錄失蹤，route 被 qwen_image 頂替），原先仍在
-# 這裡廣告，前端會選到一個必然失敗的模型。
+# qwen-image/krea2/sdxl/tts 已隨引擎退役（2026-11-17）；生圖走 h3-image（mmh3_image）。
 _KNOWN_MODELS = [
     "sora-2",              # video（newapi videos 協議）
     "grok-4.7",            # chat（grok2api :8402）
     "qwen3.8-27b",         # chat（本地 MLX）
     "qwen3.8-uncensored",  # chat（本地 MLX，pyros-vault OQ4e-mtp 無審查）
-    "qwen3-tts",           # tts（mlx-audio）
-    "sdxl-noobai", "sdxl-realvis",  # image（本地 sdxl daemon :8187，需 daemon 在跑）
-    "qwen-image-2.1",      # image（sd.cpp Metal，Viggle v0.3 6 步蒸餾）
-    "krea2",               # image（sd.cpp Metal，Krea2 v1.1 8 步 + TAEHV；compat_openai 認名字含 krea2）
-    "qwen-image-2.1-nsfw",  # image（同引擎走 uncensored base，params["uncensored"]=True）
+    "h3-image",            # image（mmh3_image，Metal 16MP；compat_openai 認名字含 h3-image/mmh3）
 ]
 
 
@@ -226,12 +221,11 @@ def _upstream_error(message: str, status: int = 502) -> JSONResponse:
 
 
 def _video_running() -> bool:
-    # Must mirror core._admit_next's heavy-job list (core.py:232). qwen_image runs
-    # sd.cpp at MEM_GB 26 / RSS 22-27GB; core.py:229-231 documents the kernel kill
-    # when it coexists with the 19GB resident LLM. Omitting it let chat load 19GB
-    # straight into a running image job, bypassing every scheduler guard.
+    # Must mirror core._admit_next's heavy-job list (core.py:232): mmh3 20GB /
+    # mmh3_image 22GB / shot。budget 看不到 dense/attention 瞬態（2026-11-17
+    # watchdog panics），所以兩側都靠這份名單硬閘，不要依賴預算計算。
     rows = core.db().execute(
-        "SELECT 1 FROM jobs WHERE status='running' AND type IN ('video','shot','qwen_image') LIMIT 1"
+        "SELECT 1 FROM jobs WHERE status='running' AND type IN ('mmh3','mmh3_image','shot') LIMIT 1"
     ).fetchall()
     return bool(rows)
 
@@ -278,7 +272,7 @@ def chat_completions(req: ChatRequest):
             # omlx 同样不认工具字段，剥掉（grok 分支原样透传）。
             body.pop("tools", None)
             body.pop("tool_choice", None)
-            # omlx 16.2GB（實測）與 video/shot(35GB)/qwen_image(26GB) 在 48GB 上互斥。
+            # omlx 16.2GB（實測）與 mmh3(20GB)/mmh3_image(22GB)/shot 在 48GB 上互斥。
             # 本地 qwen 分支一直有這道閘（:234），omlx 分支漏了——2026-10-10 00:12 的
             # 分鏰生成 Metal OOM 就是它：視頻在跑時照樣拉起 16GB，51>48 直接爆。
             if _video_running():

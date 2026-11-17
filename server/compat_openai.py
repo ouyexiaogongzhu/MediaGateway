@@ -1,10 +1,9 @@
-"""OpenAI-compatible image & audio faces for 影策 (openai-image / openai-audio).
+"""OpenAI-compatible image face for 影策 (openai-image).
 
-影策 adapters (backend/internal/protocol/builtin.go):
+影策 adapter (backend/internal/protocol/builtin.go):
   openai-image  POST /v1/images/generations  -> {data:[{b64_json}]}   (sync)
-  openai-audio  POST /v1/audio/speech        -> JSON with url/data field
-We run the local workers through the normal scheduler and wait synchronously —
-both are short tasks (image ~70s, TTS ~10s) and the caller is local.
+We run the local worker through the normal scheduler and wait synchronously —
+the image task is short (~70s) and the caller is local.
 """
 from __future__ import annotations
 
@@ -32,7 +31,7 @@ from . import core
 
 router = APIRouter()
 
-# Must outlast the worker's own deadline (qwen_image.DEFAULT_TIMEOUT = 1800).
+# Must outlast the worker's own timeout (mmh3_image: 900s per job).
 # A 504 here abandons a job the worker is still running, and for images it drops
 # the temp dir whose ref PNGs the still-queued jobs have to read — so they fail
 # instantly on "load image ... failed" instead of doing their own work.
@@ -110,7 +109,8 @@ class ImageGenIn(BaseModel):
 
 
 def _parse_size(size: Optional[str]) -> tuple[int, int]:
-    width, height = 512, 512
+    """H3-Image 工作範圍：32 倍數、單邊 512-6400（worker 同規則，2048² 起跳）。"""
+    width, height = 2048, 2048
     if size:
         try:
             w, h = size.lower().replace("×", "x").split("x", 1)
@@ -119,36 +119,20 @@ def _parse_size(size: Optional[str]) -> tuple[int, int]:
             raise HTTPException(400, "size must be WxH")
         width -= width % 32
         height -= height % 32
-        if width < 32 or height < 32:
-            raise HTTPException(400, "resolution too small")
-        if max(width, height) > 1536:
-            raise HTTPException(400, "resolution too large (max side 1536)")
+        if width < 512 or height < 512:
+            raise HTTPException(400, "resolution too small (min side 512)")
+        if max(width, height) > 6400:
+            raise HTTPException(400, "resolution too large (max side 6400)")
     return width, height
 
 
-# 生圖模型名守門（必須匹配 qwen-image 而非 qwen，否則 qwen3.8-27b 等 CHAT 模型名會被吞進生圖）
-_IMAGE_MODEL_KEYS = ("qwen-image", "krea2")
+# 生圖模型名守門（匹配 h3-image/mmh3 而非裸 mmh3 的 CHAT 名誤吞由端點隔離保證：
+# /v1/images 只收生圖模型名）
+_IMAGE_MODEL_KEYS = ("h3-image", "mmh3")
 
 
 def _is_image_model(model: Optional[str]) -> bool:
     return bool(model) and any(k in model.lower() for k in _IMAGE_MODEL_KEYS)
-
-
-def _engine_params_for_model(model: Optional[str]) -> dict:
-    """模型名 → qwen_image worker 的引擎選擇參數。generations / edits 兩條路由共用。
-
-    模型名帶 krea2 → engine="krea2"（第二引擎：西方寫實質感/直白構圖）；
-    帶 uncensored/nsfw → uncensored=True（qwen_image._pick_engine 的舊捷徑，
-    現等同「要 krea2」）。其餘落到預設 viggle。
-    不做引擎名校驗——那是 _pick_engine 的事，壞名字讓它自己 raise。
-    """
-    mlow = (model or "").lower()
-    params = {}
-    if "uncensored" in mlow or "nsfw" in mlow:
-        params["uncensored"] = True
-    if "krea2" in mlow:
-        params["engine"] = "krea2"
-    return params
 
 
 @router.post("/v1/images/generations")
@@ -172,39 +156,19 @@ async def images_generations(req: ImageGenIn):
             return JSONResponse(status_code=502, content={
                 "error": {"message": f"grok2api 不可达：{e}", "type": "upstream_error"}})
         return {"created": int(time.time()), "data": d.get("data", [])}
-    # 生圖路由（model 含 qwen-image 或 krea2）：sd.cpp Metal worker，生圖 API 復活主引擎
-    # 兩條引擎共用同一個 worker：krea2 是第二引擎（西方寫實質感/直白構圖），
-    # 不在模型名裡寫死就要呼叫端傳 engine，否則 krea2 這條線從 API 走不到。
+    # 生圖路由（model 含 h3-image/mmh3）：mmh3_image worker（Metal，16MP 級）
     if _is_image_model(req.model):
         data = []
         for i in range(n):
-            params = {"prompt": req.prompt, "width": width, "height": height,
-                      **_engine_params_for_model(req.model)}
+            params = {"prompt": req.prompt, "width": width, "height": height}
             if req.seed is not None:
                 params["seed"] = req.seed + i
-            job = await _wait_job(core.create_job("qwen_image", params)["id"])
+            job = await _wait_job(core.create_job("mmh3_image", params)["id"])
             with open(job["output_path"], "rb") as f:
                 data.append({"b64_json": base64.b64encode(f.read()).decode()})
         return {"created": int(time.time()), "data": data}
-    # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：本地 daemon :8187，無 h3/iris 依賴
-    if req.model and any(k in req.model.lower() for k in ("sdxl", "realvis", "noobai")):
-        daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
-        body = {"model": "realvis" if "realvis" in req.model.lower() else
-                ("noobai" if "noobai" in req.model.lower() else "sdxl"),
-                "prompt": req.prompt, "width": width, "height": height,
-                "steps": 30, "guidance_scale": 5.0}
-        if req.seed is not None:
-            body["seed"] = req.seed
-        data = []
-        for i in range(n):
-            # seed 缺省 0：不分 offset 的話 n>1 會拿回同一張圖。
-            body["seed"] = (req.seed or 0) + i
-            d = await asyncio.to_thread(_post_json, daemon + "/generate", body, 600)
-            with open(d["path"], "rb") as f:
-                data.append({"b64_json": base64.b64encode(f.read()).decode()})
-        return {"created": int(time.time()), "data": data}
     return JSONResponse(status_code=501, content={
-        "error": {"message": "iris 已退役（2026-09-28）；生圖請用 model=qwen-image-2.1 或 sdxl*/noobai/realvis",
+        "error": {"message": "qwen-image/krea2/sdxl/iris 已退役；生圖請用 model=h3-image",
                   "type": "invalid_request_error"}})
 
 
@@ -237,15 +201,13 @@ def _save_ref(idx: int, data: bytes, tmpdir: str) -> str:
 @router.post("/v1/images/edits")
 async def images_edits(request: Request):
     """影策带参考图生图，双协议端点：
-    - multipart（服务端 openai-image 路径）：Form + UploadFile → iris / SDXL
+    - multipart（服务端 openai-image 路径）：Form + UploadFile → mmh3_image
     - JSON（影策 openai-images 声明式插件）：{model,prompt,images:[{image_url:dataURL}],...}
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
     ctype = request.headers.get("content-type", "")
     raw_body = await request.body()
-    variant: Optional[str] = None
-    strength: Optional[float] = None
     mask_data: Optional[bytes] = None
     if ctype.startswith("application/json"):
         payload = await request.json()
@@ -280,11 +242,8 @@ async def images_edits(request: Request):
         prompt = str(form.get("prompt") or "")
         model = form.get("model") or None
         size = form.get("size") or None
-        variant = form.get("variant") or None
         seed = form.get("seed")
         seed = int(seed) if seed not in (None, "") else None
-        strength = form.get("strength")
-        strength = float(strength) if strength not in (None, "") else None
         n = int(form.get("n") or 1)
         images = []
         for k, v in form.multi_items():
@@ -323,106 +282,28 @@ async def images_edits(request: Request):
     if not prompt.strip():
         raise HTTPException(400, "prompt is required")
     n = max(1, min(n or 1, 4))
-    # 生圖路由（model 含 qwen-image 或 krea2）：图+文编辑（-r 参考图），走 qwen_image worker
+    # 生圖路由（model 含 h3-image/mmh3）：图+文编辑（--reference 可重複至 16），走 mmh3_image worker
     if _is_image_model(model):
         width, height = _parse_size(size)
-        tmpdir = tempfile.mkdtemp(prefix="mg_edits_qwen_")
+        tmpdir = tempfile.mkdtemp(prefix="mg_edits_h3img_")
         try:
             refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
-            # 模型名带 krea2/uncensored/nsfw → Krea2（viggle 本身零降级，但 krea2 的
-            # 西方写实质感才是这些调用方要的），与 generations 同一条推导
             imgs = []
             for i in range(n):
-                params = {"prompt": prompt, "width": width, "height": height, "refs": refs,
-                          **_engine_params_for_model(model)}
+                params = {"prompt": prompt, "width": width, "height": height, "refs": refs}
                 if seed is not None:
                     params["seed"] = seed + i
-                job = await _wait_job(core.create_job("qwen_image", params)["id"])
+                job = await _wait_job(core.create_job("mmh3_image", params)["id"])
                 with open(job["output_path"], "rb") as f:
                     imgs.append({"b64_json": base64.b64encode(f.read()).decode()})
             return {"created": int(time.time()), "data": imgs}
         finally:
             # refs 要活到最后一个 job 结束，rmtree 只能在循环之后
             shutil.rmtree(tmpdir, ignore_errors=True)
-    # SDXL daemon 路由（model 含 sdxl/realvis/noobai）：img2img 重绘，无 h3/iris 依赖
-    if model and any(k in model.lower() for k in ("sdxl", "realvis", "noobai")):
-        width, height = _parse_size(size)
-        daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
-        tmpdir = tempfile.mkdtemp(prefix="mg_edits_sdxl_")
-        try:
-            refs = [_save_ref(i, data, tmpdir) for i, (data, _) in enumerate(images)]
-            mlow = model.lower()
-            imgs = []
-            for i in range(n):
-                body = {"model": "realvis" if "realvis" in mlow else
-                        ("noobai" if "noobai" in mlow else "sdxl"),
-                        "prompt": prompt, "width": width, "height": height,
-                        "seed": (seed if seed is not None else 0) + i,
-                        "init_image_path": refs[0],
-                        "strength": strength if strength is not None else 0.45}
-                # model 含控制类型词 → ControlNet 路由：第一张参考图作 control 源
-                for ctype in ("openpose", "depth", "canny", "lineart", "white", "pose"):
-                    if ctype in mlow:
-                        body["control_type"] = ctype
-                        body["control_image_path"] = refs[0]
-                        break
-                d = await asyncio.to_thread(_post_json, daemon + "/generate", body, 900)
-                if not d.get("path"):
-                    raise HTTPException(400, f"sdxl daemon: {str(d)[:200]}")
-                with open(d["path"], "rb") as f:
-                    imgs.append({"b64_json": base64.b64encode(f.read()).decode()})
-            return {"created": int(time.time()), "data": imgs}
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+    # qwen-image/krea2/sdxl/iris/aux 已退役（2026-11-17）；參考圖編輯走 model=h3-image
     return JSONResponse(status_code=501, content={
-        "error": {"message": "iris 已退役（2026-09-28）；參考圖編輯請用 model 含 sdxl*/noobai/realvis（img2img/ControlNet）",
+        "error": {"message": "sdxl/iris/aux 已退役；參考圖編輯請用 model=h3-image",
                   "type": "invalid_request_error"}})
-
-
-@router.post("/v1/aux")
-async def aux_preprocess(request: Request):
-    """本地 aux 预处理（SDXL daemon :8187 /annotate，同步）：
-    white(白模/法线)/depth/lineart/pose(骨骼)/canny → 控制图 b64_json。
-    源图：JSON {type, image: dataURL|httpURL | image_path, width?, height?}
-    """
-    payload = await request.json()
-    a_type = str(payload.get("type") or "").lower()
-    if not a_type:
-        raise HTTPException(400, "type is required (white/depth/lineart/pose/canny)")
-    body = {"type": a_type}
-    w, h = int(payload.get("width") or 0), int(payload.get("height") or 0)
-    if w and h:
-        body["width"], body["height"] = w, h
-    src = payload.get("image_path")
-    tmpdir = None
-    if not src:
-        du = str(payload.get("image") or payload.get("image_url") or "")
-        if du.startswith("data:"):
-            raw = base64.b64decode(du.split(",", 1)[1])
-        elif du.startswith("http"):
-            try:
-                raw = await asyncio.to_thread(_fetch_bytes, du, 120)
-            except Exception as e:
-                raise HTTPException(400, f"fetch image failed: {str(e)[:120]}")
-        else:
-            raise HTTPException(400, "image (data URL / http URL) or image_path is required")
-        tmpdir = tempfile.mkdtemp(prefix="mg_aux_")
-        src = Path(tmpdir) / "in.png"
-        src.write_bytes(raw)
-    body["image_path"] = str(src)
-    daemon = os.environ.get("SDXL_DAEMON_URL", "http://127.0.0.1:8187")
-    try:
-        d = await asyncio.to_thread(_post_json, daemon + "/annotate", body, 300)
-    except urllib.error.HTTPError as e:
-        raise HTTPException(e.code, f"daemon: {e.read()[:200].decode('utf-8', 'replace')}")
-    finally:
-        if tmpdir:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-    if not d.get("path"):
-        raise HTTPException(400, str(d)[:300])
-    with open(d["path"], "rb") as f:
-        img = base64.b64encode(f.read()).decode()
-    return {"created": int(time.time()), "type": d.get("type"), "data": [{"b64_json": img}]}
 
 
 def _wav_duration(path: str) -> float:
@@ -452,56 +333,8 @@ def _wav_duration(path: str) -> float:
     return round(data_size / (rate * channels * bits // 8), 2)
 
 
-class SpeechIn(BaseModel):
-    model: Optional[str] = None
-    input: str
-    voice: Optional[str] = None
-    speed: float = 1.0
-
-
-def _known_voice(model: Optional[str], default: bool = False) -> Optional[str]:
-    """影策渠道模型把 voiceId 放在 model 字段；命中 tts_qwen 內建 speaker 才採納。
-
-    CosyVoice 的 voices.json 音色庫已隨引擎退役（2026-10-04）——suwan/aila 是
-    零聲克隆用的參考音檔，不是 tts_qwen 的 speaker 名。default=True 交給 worker
-    的 DEFAULT_VOICE 兜底。
-    """
-    from .workers.tts_qwen import DEFAULT_VOICE, TTS_SPEAKERS
-    if model and model in TTS_SPEAKERS:
-        return model
-    return DEFAULT_VOICE if default else None
-
-
-@router.post("/v1/audio/speech")
-async def audio_speech(req: SpeechIn, request: Request):
-    if not req.input.strip():
-        raise HTTPException(400, "input is required")
-    params: dict = {"text": req.input, "speed": req.speed}
-    # CosyVoice 退役後只有一條語音路徑（2026-10-04）。model 非 qwen 時走 _known_voice
-    # 過濾——那是影策渠道把 voiceId 塞在 model 欄位的相容，不是第二個引擎。
-    voice = req.voice if req.voice and req.voice != req.model else _known_voice(req.model, default=True)
-    if voice:
-        params["voice"] = voice
-    job = core.create_job("tts_qwen", params)
-    job = await _wait_job(job["id"], timeout=300)
-    base = str(request.base_url).rstrip("/")
-    try:
-        duration = _wav_duration(job["output_path"])
-    except Exception:  # noqa: BLE001 — non-wav output (tests/fakes): no duration
-        duration = None
-    return {"url": f"{base}/v1/audio/jobs/{job['id']}/content", "duration_seconds": duration}
-
-
-@router.get("/v1/audio/jobs/{job_id}/content")
-def audio_content(job_id: str):
-    job = core.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "audio not found")
-    op = job["output_path"]
-    if job["status"] != "completed" or not op or not os.path.isfile(op):
-        raise HTTPException(409, "audio not ready")
-    return FileResponse(op, media_type="audio/wav")
-
+# TTS 已全退役（tts_qwen worker 2026-11-17 刪）：/v1/audio/speech 端點一併移除，
+# 影策的 openai-audio 渠道 enum 保留但 dormant（enabled=0，無 caller）。
 
 # --- music face (ACE-Step via the scheduler; see workers/music.py) ---
 

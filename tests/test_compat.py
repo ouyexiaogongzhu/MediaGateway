@@ -37,7 +37,6 @@ from fastapi.testclient import TestClient  # noqa: E402
 from server import compat_h3cweb as compat  # noqa: E402
 from server import core  # noqa: E402
 from server.main import app  # noqa: E402
-from server.workers import video  # noqa: E402
 
 core.db()  # init SQLite before the scheduler thread starts (lazy init is racy)
 
@@ -53,16 +52,27 @@ CTX_I2VA = ("For the target video, at 0.00 seconds into the target video, "
             "traffic.\n\nnon_diegetic_music: N/A")
 
 
-class FakeEngine:
-    def close(self):
-        pass
+class FakeMmh3:
+    """Worker-shaped stand-in for mmh3: writes the output file, one tick.
 
-    def generate(self, prompt, *, output_path, refs=None, on_progress=None, **ov):
-        Path(output_path).write_bytes(b"FAKE")
-        if on_progress:
-            on_progress("denoise", 1, 1)
-        return {"width": ov.get("width"), "height": ov.get("height"),
-                "frames": ov.get("frames", 48), "fps": 24, "seed": 7}
+    Registered into core._REGISTRY so /jobs and /v1/videos never spawn the
+    real Metal CLI from inside a test run.
+    """
+
+    TYPE = "mmh3"
+    MEM_GB = 20.0
+    __name__ = "tests.test_compat.FakeMmh3"  # /info lists worker module names
+
+    def run(self, params, job_dir, progress, cancel):
+        out = Path(job_dir) / "output.mp4"
+        out.write_bytes(b"FAKE")
+        progress(1.0, "denoise")
+        return {"output_path": str(out), "frames": params.get("frames", 48)}
+
+
+core.registry()  # populate real workers first — a pre-seeded _REGISTRY is
+                 # truthy and would skip auto-discovery for the whole suite
+core._REGISTRY["mmh3"] = FakeMmh3()
 
 
 def wait_done(client, job_id, timeout=5.0):
@@ -89,7 +99,7 @@ def test_post_jobs_params_and_lifecycle(client):
     assert body["requested_output_path"] == os.path.join(_TMP, "shots", "out.mp4")
     p = core.get_job(body["job_id"])["params"]
     assert p["prompt"] == CTX_I2VA and p["width"] == 864 and p["height"] == 480
-    assert p["seconds"] == 2 and p["seed"] == 5 and p["steps"] == 6
+    assert p["seconds"] == 2 and p["seed"] == 5 and p["steps"] == 4
     assert p["refs"][0]["path"] == os.path.join(_TMP, "in.png")  # resolved vs BASE_DIR
     assert p["requested_output_path"].endswith("out.mp4")
     done = wait_done(client, body["job_id"])
@@ -158,12 +168,13 @@ def test_v1_videos_validation(client):
     # prompt is accepted now (see test above), so every 400 below is the size/ref
     # rule and nothing else.
     for payload, code in (
-        ({"prompt": CTX_T2VA, "size": "1280×960"}, 400),   # cap 768*1344
+        ({"prompt": CTX_T2VA, "size": "1280×1792"}, 400),  # cap mmh3 VSA 1024*1792
         ({"prompt": CTX_T2VA, "size": "abc"}, 400),        # not WxH
         ({"prompt": CTX_T2VA, "size": "16x16"}, 400),      # too small
         ({"prompt": CTX_T2VA, "input_reference": ["http://x/y.png"]}, 400),  # not data URL
         ({"prompt": CTX_T2VA, "video_url": "http://x/v.mp4"}, 400),  # unsupported media
         ({"size": "512x288"}, 400),                   # prompt required
+        ({"prompt": CTX_T2VA, "size": "1024×1792"}, 200),  # VSA 上限內（1080 級唯一路）
     ):
         r = client.post("/v1/videos", json=payload)
         assert r.status_code == code, (payload, r.status_code, r.text)
@@ -333,11 +344,12 @@ def test_files_traversal_and_serving(client):
 
 def test_info_compat_shape(client):
     info = client.get("/info").json()
-    for k in ("engine", "version", "device", "model", "cache"):
+    for k in ("engine", "version", "model"):
         assert k in info, k
-    assert info["engine"] == "h3.c"
-    assert info["device"] is None  # engine not resident between jobs (documented diff)
-    assert info["model"]["dir"].endswith("MiniMax-H3")
+    assert info["engine"] == "mmh3"
+    assert info["model"]["engine"] == "mmh3"
+    assert info["model"]["cli"].endswith("mmh3")
+    assert info["engines"]["mmh3"]["mem_gb"] == 20.0
 
 
 def test_aux_annotate(client):
@@ -367,210 +379,6 @@ def test_aux_annotate(client):
         assert struct.unpack(">II", out[16:24]) == (128, 128), t
 
 
-def test_wait_ceiling_outlasts_image_worker(_c=None):
-    # A 504 while the worker still runs orphans it, and drops the temp dir whose
-    # ref PNGs the queued jobs still have to read (they then die instantly on
-    # "load image ... failed"). The HTTP wait must never undercut the worker.
-    from server import compat_openai
-    from server.workers import qwen_image
-
-    assert compat_openai._WAIT_TIMEOUT > qwen_image.DEFAULT_TIMEOUT, (
-        f"wait {compat_openai._WAIT_TIMEOUT}s <= worker {qwen_image.DEFAULT_TIMEOUT}s")
-
-
-def test_image_upscale_routing(_c=None):
-    # 單一 turbo 4 步路徑。實測推翻舊前提：strength 0.35 / 4 步對 NSFW 輸入
-    # 完整保留無衣狀態，所以 uncensored 不再分流到 UC base + heretic 視覺塔——
-    # params["uncensored"] 保留但忽略（不動 compat_openai 的介面合約）。
-    # UltraSharp 挂在生图管线上，输出经 --upscale-model。
-    import tempfile
-
-    from server.workers import image_upscale
-
-    captured = {}
-
-    def fake_run_cli(cmd, **_kw):
-        captured["cmd"] = cmd
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"PNG")
-
-    orig = image_upscale.run_cli
-    image_upscale.run_cli = fake_run_cli
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "in.png"
-            src.write_bytes(b"PNG")
-            image_upscale.run({"image_path": str(src), "width": 1728, "height": 960},
-                              Path(tmp), lambda *a: None, lambda: False)
-            cmd = captured["cmd"]
-            assert "qwen_image_2.1_turbo_Q4_K_M.gguf" in " ".join(cmd)
-            assert cmd[cmd.index("--steps") + 1] == "4"
-            assert cmd[cmd.index("--strength") + 1] == "0.35"
-
-            # uncensored 必須被忽略：同一條 turbo 路徑，不換底模、不掛 heretic 視覺塔
-            image_upscale.run({"image_path": str(src), "width": 1728, "height": 960,
-                               "uncensored": True, "steps": 4},
-                              Path(tmp), lambda *a: None, lambda: False)
-            cmd = captured["cmd"]
-            joined = " ".join(cmd)
-            assert "qwen_image_2.1_turbo_Q4_K_M.gguf" in joined, "unc must not change model"
-            assert "UC-Q4_K_M" not in joined and "heretic" not in joined
-            assert "--llm_vision" not in cmd
-            assert cmd[cmd.index("--steps") + 1] == "4", "explicit steps must override"
-
-            # 已刪除的檔不能再出現在任何一條路徑上
-            assert "qwen_image_2.1-Q4_K.gguf" not in joined
-    finally:
-        image_upscale.run_cli = orig
-
-
-def test_qwen_image_refs_trimmed(_c=None):
-    # 9-10 refs ballooned sd-cli to ~22GB on 48GB unified memory and stalled at
-    # 0.3% CPU forever — same death spiral as 1024x1024, trigger axis = ref count.
-    # The worker must trim refs to MAX_REFS.
-    import tempfile
-
-    from server.workers import qwen_image
-
-    captured = {}
-
-    def fake_run_cli(cmd, **_kw):
-        captured["cmd"] = cmd
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"PNG")
-
-    orig = qwen_image.run_cli
-    qwen_image.run_cli = fake_run_cli
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            refs = [f"/tmp/ref_{i}.png" for i in range(10)]
-            qwen_image.run({"prompt": "x", "width": 864, "height": 480, "refs": refs},
-                           Path(tmp), lambda *a: None, lambda: False)
-    finally:
-        qwen_image.run_cli = orig
-    cmd = captured["cmd"]
-    passed = [cmd[i + 1] for i, v in enumerate(cmd) if v == "-r"]
-    assert len(passed) == qwen_image.MAX_REFS, f"expected {qwen_image.MAX_REFS} refs, got {len(passed)}"
-    # sd.cpp 的 -s 是 --seed 缩写；steps 必须走长旗标，否则步数永远是默认 20
-    assert "-s" not in cmd, "-s would set the seed, not steps"
-
-
-def test_viggle_sigma_count_is_steps_plus_one(_c=None):
-    # 最貴的坑：HF model card 給 6 個 sigma，那是 diffusers 格式。sd.cpp 要 steps+1 個、
-    # 尾巴補 0——只給 6 個會產出整片鹽胡椒噪點，不是「畫質差」而已。
-    from server.workers import qwen_image
-
-    cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "viggle", 1)
-    steps = int(cmd[cmd.index("--steps") + 1])
-    sigmas = cmd[cmd.index("--sigmas") + 1].split(",")
-    assert len(sigmas) == steps + 1, f"{steps} steps needs {steps + 1} sigmas, got {len(sigmas)}"
-    assert sigmas[-1] == "0", "last sigma must be 0"
-    assert cmd[cmd.index("--scheduler") + 1] == "discrete"
-
-
-def test_engine_selection(_c=None):
-    # unc 沿用舊語義當「走 Krea2」的快捷方式（viggle 對 NSFW 零降級，舊的
-    # 去審查底模前提已不成立）。優先級：任務 engine 參數 > env > unc 推導。
-    import os
-
-    from server.workers import qwen_image
-
-    def cmd_for(**params):
-        return qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024,
-                                   qwen_image._pick_engine(params, None), 1)
-
-    orig_unc = os.environ.pop("QWEN_IMAGE_UNCENSORED", None)
-    orig_eng = os.environ.pop("QWEN_IMAGE_ENGINE", None)
-    try:
-        # 默认 = Viggle 主力
-        assert qwen_image._pick_engine({}, False) == "viggle"
-        # 向後相容：unc 參數 / QWEN_IMAGE_UNCENSORED 都要能走，不能讓呼叫端炸掉
-        assert qwen_image._pick_engine({"uncensored": True}, True) == "krea2"
-        os.environ["QWEN_IMAGE_UNCENSORED"] = "1"
-        assert qwen_image._pick_engine({}, None) == "krea2"
-        # 顯式指定優先於 env
-        assert qwen_image._pick_engine({"engine": "viggle"}, True) == "viggle"
-        os.environ["QWEN_IMAGE_ENGINE"] = "krea2"
-        assert qwen_image._pick_engine({}, False) == "krea2"
-        try:
-            qwen_image._pick_engine({"engine": "sdxl"}, False)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("unknown engine must raise, not silently fall back")
-    finally:
-        for k in ("QWEN_IMAGE_UNCENSORED", "QWEN_IMAGE_ENGINE"):
-            os.environ.pop(k, None)
-        if orig_unc is not None:
-            os.environ["QWEN_IMAGE_UNCENSORED"] = orig_unc
-        if orig_eng is not None:
-            os.environ["QWEN_IMAGE_ENGINE"] = orig_eng
-
-
-def test_krea2_tae_and_refs(_c=None):
-    # --tae(TAEHV) 是 Krea2 的 2 倍提速來源：wan VAE 真 decode 84s / 207s。
-    # 少了它 Krea2 直接慢一半以上。Krea2 走 --diffusion-fa 不是 --fa，且不開 sigmas。
-    from server.workers import qwen_image
-
-    cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "krea2", 1)
-    assert cmd[cmd.index("--tae") + 1].endswith("taew2_1.safetensors")
-    assert cmd[cmd.index("--steps") + 1] == "8"
-    assert cmd[cmd.index("--cfg-scale") + 1] == "1.0"
-    assert "--diffusion-fa" in cmd and "--sigmas" not in cmd
-    # Krea2 用 4B + wan VAE，不是 Qwen 系那套
-    assert "Qwen3VL-4B" in " ".join(cmd) and "wan_2.1_vae" in " ".join(cmd)
-
-    # Krea2 參考圖路徑 2026-10-02 實測通過（view/krea_r4bmmproj.png），
-    # 所以要 refs 時**留在 Krea2**，不再退回 Viggle。
-    assert qwen_image.ENGINES["krea2"]["refs"]
-    import tempfile
-
-    captured = {}
-
-    def fake_run_cli(c, **_kw):
-        captured["cmd"] = c
-        Path(c[c.index("-o") + 1]).write_bytes(b"PNG")
-
-    orig = qwen_image.run_cli
-    qwen_image.run_cli = fake_run_cli
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            res = qwen_image.run({"prompt": "x", "width": 512, "height": 512,
-                                  "uncensored": True, "refs": ["/tmp/r.png"]},
-                                 Path(tmp), lambda *a: None, lambda: False)
-    finally:
-        qwen_image.run_cli = orig
-    assert res["engine"] == "krea2"
-    assert captured["cmd"][captured["cmd"].index("--steps") + 1] == "8"
-    # ⚠️ 視覺塔必須是 4B 那顆。配 8B 的會靜默失效（rc=0 但無視 -r，
-    #    llm.hpp:386 "vision projector output size ... does not match"）。
-    assert "mmproj-Qwen3VL-4B-Instruct-F16" in " ".join(captured["cmd"])
-
-
-def test_dbcache_is_opt_in_and_ghosts_at_512(_c=None):
-    # 生產預設 nocache。dbcache(th=0.1) 在 1024² 目檢乾淨，但在 512² 實測明顯鬼影：
-    # 左側半透明重複人形 + 主體周圍 2~3 張幽靈臉。短劇草稿檔就是 512x288/512²，
-    # 髒的剛好是產量最大那一級，省 9.1% 買不到。開回來：QWEN_IMAGE_DBCACHE=1。
-    from server.workers import qwen_image
-
-    assert qwen_image.DBCACHE_OPTION == "threshold=0.1", "ghosting/re-exposure bug"
-    assert "warmup" not in qwen_image.DBCACHE_OPTION
-    for eng in qwen_image.ENGINES:
-        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, eng, 1)
-        assert "--cache-mode" not in cmd, f"{eng} must not ship cache by default"
-        # --offload-to-cpu 去掉反而慢，别動
-        assert "--offload-to-cpu" in cmd
-        # --mmap 統一記憶體下是負收益(+8%)，--eager-load 淨虧 4s，都不要加
-        assert "--mmap" not in cmd and "--eager-load" not in cmd
-    # 門檻/warmup 那兩個坑是「萬一開回來」的前提，別趁改預設時一併放寬
-    orig = qwen_image.DBCACHE
-    qwen_image.DBCACHE = True
-    try:
-        cmd = qwen_image._cli_cmd("x", Path("/tmp/o.png"), 1024, 1024, "viggle", 1)
-    finally:
-        qwen_image.DBCACHE = orig
-    assert cmd[cmd.index("--cache-mode") + 1] == "dbcache"
-    assert cmd[cmd.index("--cache-option") + 1] == "threshold=0.1"
-
-
 def test_plist_does_not_re_enable_dbcache(_c=None):
     # 程式碼預設值在生產上是廢的——launchd 注入的 EnvironmentVariables 蓋掉它。
     # QWEN_IMAGE_DBCACHE=1 就是生產裡偷偷開快取的那個開關，只翻程式碼不會生效。
@@ -585,32 +393,3 @@ def test_plist_does_not_re_enable_dbcache(_c=None):
     assert "QWEN_IMAGE_TURBO" not in env, "dead setting, nothing reads it"
 
 
-def test_krea2_model_files_exist(_c=None):
-    # M5 有已知 bug（sd.cpp issue 1990）會靜默產出純白 PNG，路徑打錯時 sd-cli
-    # 有時不報錯。模型檔不存在就在跑圖前擋掉，不要等一張白圖回來。
-    from server.workers import qwen_image
-
-    root = Path(qwen_image.DEFAULT_HOME)
-    if not (root / "build" / "bin" / "sd-cli").is_file():
-        return  # 沒裝 sd.cpp 的機器（CI）不檢查模型檔
-    for eng, e in qwen_image.ENGINES.items():
-        for key in ("diff", "vae", "tae", "llm", "vision"):
-            p = e.get(key)
-            if p:
-                assert (root / p).is_file(), f"{eng}.{key} missing: {root / p}"
-
-
-if __name__ == "__main__":
-    video._get_engine = lambda: FakeEngine()  # inject fake; scheduler runs it for real
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failures = 0
-    with TestClient(app) as c:
-        for t in tests:
-            try:
-                t(c)
-                print(f"PASS {t.__name__}")
-            except AssertionError as e:
-                failures += 1
-                print(f"FAIL {t.__name__}: {e}")
-    print(f"\n{len(tests) - failures}/{len(tests)} tests passed")
-    sys.exit(1 if failures else 0)

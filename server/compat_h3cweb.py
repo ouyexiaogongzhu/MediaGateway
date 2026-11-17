@@ -32,7 +32,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import core
-from .workers import video
 
 BASE_DIR = os.environ.get("H3CWEB_COMPAT_BASE_DIR", "/Users/vincent/code/h3cweb")
 OUT_DIR = os.environ.get("H3CWEB_COMPAT_OUT_DIR",
@@ -136,11 +135,13 @@ class Ref(BaseModel):
 class JobRequest(BaseModel):
     prompt: str
     refs: List[Ref] = []
-    width: int = 864
-    height: int = 480
+    # 房默認：768×1344 豎屏（H3 768p 官方畫質基準檔；mmh3 VSA 實測甜蜜點
+    # 5.5 分/124f/15.9GiB，mmh3_report §4）
+    width: int = 768
+    height: int = 1344
     seconds: Optional[float] = None
     frames: Optional[int] = None
-    steps: int = 6
+    steps: int = 4  # FastH3 蒸餾設計步數（docs/fasth3.md）；6 步無 A/B 增益證據
     denoise_reuse: int = 1
     dit_layers: int = 45
     core_reuse: int = 1
@@ -172,19 +173,11 @@ _STATUS = {"queued": "queued", "running": "running", "completed": "completed",
 
 @router.get("/info")
 def info():
-    eng = video._engine
-    device = model = cache = None
-    if eng is not None:
-        try:
-            device, model, cache = eng.device(), eng.model(), eng.cache_info()
-        except Exception:  # engine mid-load/close; placeholders are fine
-            pass
     return {
-        "engine": "h3.c",
+        "engine": "mmh3",
         "version": "0.1.0-dev",
-        "device": device,
-        "model": model or {"dir": video.MODEL_DIR, "loaded": eng is not None},
-        "cache": cache,
+        "model": {"engine": "mmh3", "cli": os.environ.get(
+            "MMH3_BIN", "/Users/vincent/tool/mmh3/target/release/mmh3")},
         # gateway extras (old callers ignore unknown keys)
         "engines": {t: {"mem_gb": m.MEM_GB, "module": m.__name__}
                     for t, m in core.registry().items()},
@@ -512,7 +505,7 @@ async def openai_create_video(request: Request):
     except (TypeError, ValueError):
         seconds = None
 
-    width, height = 864, 480
+    width, height = 768, 1344  # 房默認，與影策 sora-2 defaultRatio 一致
     if size:
         # canvas sends typographic ×, e.g. "512×288"
         size = size.strip().replace("×", "x").replace("X", "x")
@@ -526,19 +519,12 @@ async def openai_create_video(request: Request):
         height -= height % 32
     if width < 32 or height < 32:
         raise HTTPException(400, "resolution too small")
-    model_key = str(raw.get("model") or (form.get("model") if ct.startswith("multipart/") else "") or "")
-    # SDXL 圖片路由（model 含 sdxl/realvis/noobai）：本地 daemon，豎版 832x1216 默認，無 h3 像素上限
-    if any(k in model_key.lower() for k in ("sdxl", "realvis", "noobai")):
-        sp = {"prompt": prompt,
-              # 豎版默認，不走上面視頻 864x480 默認
-              "width": width if size else 832, "height": height if size else 1216}
-        for key in ("negative_prompt", "model", "steps", "guidance_scale", "seed"):
-            if raw.get(key) is not None:
-                sp[key] = raw[key]
-        resp = core.create_job("sdxl", sp)
-        return {"id": resp["id"], "task_id": resp["id"], "status": resp["status"]}
-    if width * height > 768 * 1344:
-        raise HTTPException(400, "resolution exceeds h3 768*1344 pixel limit")
+    # mmh3 VSA envelope: verified shapes run to 1024x1792 (1080 級唯一路，dense
+    # 在本機 ≥1080 是 OOM×2 實錘禁區). Bigger than that = 400; in-between shapes
+    # (e.g. 896x1600) pass the gate but may fail in the worker — INT8 packed
+    # matrices only cover verified shapes (1088x1920 crashes, see mmh3_report §4).
+    if width * height > 1024 * 1792:
+        raise HTTPException(400, "resolution exceeds mmh3 VSA 1024*1792 pixel limit")
     # h3.c:866 ref2va = reference_count != 0：有 refs 时首尾帧被静默忽略（h3_valid_params
     # 的互斥报错要等 35GB 引擎加载完才触发）。在入口显式拒绝，把静默丢帧变成 fast 400。
     if ref_paths and (first_frame or last_frame):

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import types
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -74,43 +75,29 @@ def test_run_job_fails_job_when_setup_raises():
     assert job["status"] == "failed" and job["error"], job
 
 
-def test_budget_counts_resident_engines():
-    class FakeVideo:
-        MEM_GB = 35.0
-        _engine = object()  # resident (keep_loaded)
-
-    class FakeVoice:
-        MEM_GB = 8.7
-
-        class _P:
-            @staticmethod
-            def poll():
-                return None  # alive
-
-        _proc = _P()
-
-    saved = dict(core._REGISTRY)
+def test_budget_counts_resident_llm():
+    """_resident_gb counts only between-job residents: the chat LLM face.
+    (The old video keep_loaded / voice tts_server residents died with those
+    workers — mmh3 spawns a fresh CLI per job, nothing stays resident.)"""
+    llm = types.SimpleNamespace(MEM_GB=19.0, resident=lambda: True)
+    sys.modules["server.llm"] = llm
     try:
-        core._REGISTRY.update({"video": FakeVideo, "voice": FakeVoice})
-        gb = core._resident_gb(core._REGISTRY)
-        assert abs(gb - 43.7) < 0.01, gb  # 35 (engine) + 8.7 (tts alive)
+        assert core._resident_gb(core._REGISTRY) == 19.0
     finally:
-        core._REGISTRY.clear()
-        core._REGISTRY.update(saved)
+        del sys.modules["server.llm"]
+    assert core._resident_gb(core._REGISTRY) == 0.0
 
 
 # --- scheduler budget: a running job's own engine must be charged once ---
 
 class _FakeWorker:
     """Stand-in for a server/workers/*.py module — only the scheduler-visible
-    surface (MEM_GB + the _engine/_proc resident flags). No threads, no GPU:
-    _admit_next only reads the DB, the registry and those flags, so fakes at the
-    registry boundary exercise the real accounting instead of mocking it."""
+    surface (MEM_GB). No threads, no GPU: _admit_next only reads the DB, the
+    registry and that number, so fakes at the registry boundary exercise the
+    real accounting instead of mocking it."""
 
-    def __init__(self, mem_gb, engine=None, proc=None):
+    def __init__(self, mem_gb):
         self.MEM_GB = mem_gb
-        self._engine = engine
-        self._proc = proc
 
 
 @contextmanager
@@ -158,48 +145,21 @@ def _drain(limit=10):
     return got
 
 
-def test_running_video_job_does_not_double_charge_its_engine():
-    """video._engine is set for the whole life of the job that loaded it, so
-    charging it as *resident* on top of running_gb bills the box 70 > 40 and
-    FIFO head-blocking stalls the entire queue for the length of the render."""
-    vid = _FakeWorker(35.0, engine=object())  # engine live: the running job holds it
-    with _sched(video=vid, concat=_FakeWorker(1.0)) as db:
-        _add(db, "run", "video", "running")
-        _add(db, "next", "concat", "queued", 1)
-        assert core._resident_gb(core.registry(), {"video"}) == 0, \
-            "engine held by an in-flight job is already charged via running_gb"
-        nxt = core._admit_next()
-        assert nxt is not None and nxt[1]["id"] == "next", \
-            "a normal video job must not block a job that fits (35+1 <= 40)"
-        assert 35.0 + 1.0 <= core.BUDGET_GB
-
-
 def test_video_stays_exclusive_while_one_is_running():
-    """The double-charge used to *incidentally* keep two video engines from
-    coexisting (docs/integration_plan.md P1-3). Removing it must not remove that
-    too — video.py:34 relies on the scheduler for video exclusivity."""
-    vid = _FakeWorker(35.0, engine=object())
+    """One 35GB video job + a second queued one: 35+35 > 40 blocks the second —
+    the budget alone keeps GPU engines exclusive (no double-charge involved;
+    _resident_gb no longer tracks per-worker engines, mmh3 spawns per job)."""
+    vid = _FakeWorker(35.0)
     with _sched(video=vid, concat=_FakeWorker(1.0)) as db:
         _add(db, "run", "video", "running")
         _add(db, "next2", "video", "queued", 1)
         assert core._admit_next() is None, "second video job must wait (35+35 > 40)"
 
 
-def test_keep_loaded_batch_reuses_engine_at_zero_increment():
-    """Engine resident between jobs and nobody holding it: the next video job
-    must reuse it for free, or a keep_loaded batch self-deadlocks on its head."""
-    vid = _FakeWorker(35.0, engine=object())  # kept alive by the previous job
-    with _sched(video=vid) as db:
-        _add(db, "first", "video", "completed")
-        _add(db, "second", "video", "queued", 1)
-        assert core._resident_gb(core.registry()) == 35.0
-        assert _drain() == ["second"]
-
-
 def test_budget_ceiling_holds_across_a_video_batch():
     """Admit everything that fits, refuse the first job that doesn't: charged
     never passes BUDGET_GB, and the refused head blocks the rest (FIFO)."""
-    vid = _FakeWorker(35.0, engine=object())
+    vid = _FakeWorker(35.0)
     with _sched(video=vid, concat=_FakeWorker(1.0)) as db:
         _add(db, "run", "video", "running")
         for i in range(7):
@@ -210,22 +170,6 @@ def test_budget_ceiling_holds_across_a_video_batch():
                       core.db().execute("SELECT type FROM jobs WHERE status='running'"))
         charged += core._resident_gb(core.registry(), {"video"})
         assert charged == core.BUDGET_GB, charged
-
-
-def test_voice_process_is_not_double_charged_while_its_job_runs():
-    """Same accounting bug one order of magnitude smaller: the tts_server process
-    spawned by a voice job stays alive for IDLE_EXIT_S after it."""
-    class _Alive:
-        @staticmethod
-        def poll():
-            return None
-
-    with _sched(voice=_FakeWorker(8.7, proc=_Alive()),
-                concat=_FakeWorker(1.0)) as db:
-        _add(db, "run", "voice", "running")
-        _add(db, "next", "concat", "queued", 1)
-        assert core._resident_gb(core.registry(), {"voice"}) == 0
-        assert core._admit_next() is not None  # 8.7 + 1 = 9.7 <= 40
 
 
 if __name__ == "__main__":

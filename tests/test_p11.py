@@ -234,16 +234,6 @@ def test_v1_music_route():
             assert r.status_code == 400, r.text
 
 
-def test_speech_duration_seconds():
-    with tempfile.TemporaryDirectory() as d:
-        fake = FakeJob(str(Path(d) / "o.wav"))
-        with _Patched(fake):
-            client = TestClient(app)
-            r = client.post("/v1/audio/speech", json={"input": "你好"})
-            assert r.status_code == 200, r.text
-            assert abs(r.json()["duration_seconds"] - 0.1) < 0.01
-
-
 def test_concat_music_segments():
     with tempfile.TemporaryDirectory() as d:
         a, b, seg = (Path(d) / n for n in ("a.mp4", "b.mp4", "m.wav"))

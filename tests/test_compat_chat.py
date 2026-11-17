@@ -110,7 +110,7 @@ def queue_job(jtype):
 
 
 def test_mutex_blocks_video_while_llm_resident():
-    queue_job("video")
+    queue_job("mmh3")
     stub = make_llm_stub(resident=True)
     sys.modules["server.llm"] = stub
     try:
@@ -121,10 +121,10 @@ def test_mutex_blocks_video_while_llm_resident():
 
 
 def test_mutex_blocks_qwen_image_while_llm_resident():
-    # sd.cpp (Metal) + a resident 27B chat model exhausts 48GB unified memory;
-    # the kernel kills sd-cli (exited -15/-9). 16+10=26GB fits the budget, so
-    # only the mutex can block this — which is the point.
-    queue_job("qwen_image")
+    # mmh3_image peaks ~22GiB and, like mmh3, the budget cannot see dense /
+    # attention transients (2026-11-17 watchdog panics) — so the mutex, not
+    # the budget, is the guard against a resident chat engine.
+    queue_job("mmh3_image")
     stub = make_llm_stub(resident=True)
     sys.modules["server.llm"] = stub
     try:
@@ -135,11 +135,11 @@ def test_mutex_blocks_qwen_image_while_llm_resident():
 
 
 def test_mutex_releases_once_llm_gone():
-    queue_job("video")
+    queue_job("mmh3")
     sys.modules["server.llm"] = make_llm_stub(resident=False)
     try:
         nxt = core._admit_next()
-        assert nxt is not None and nxt[1]["type"] == "video"
+        assert nxt is not None and nxt[1]["type"] == "mmh3"
     finally:
         del sys.modules["server.llm"]
 
@@ -176,7 +176,7 @@ def test_chat_forwards_to_upstream():
 def test_chat_503_while_video_running():
     db = fresh_db()
     db.execute("INSERT INTO jobs (id, type, status, created_at) "
-               "VALUES ('v_run', 'video', 'running', 0)")
+               "VALUES ('v_run', 'mmh3', 'running', 0)")
     db.commit()
 
     def go():
