@@ -44,7 +44,7 @@ def test_util_not_in_registry():
     core._REGISTRY.clear()
     try:
         assert "_util" not in core.registry()
-        assert "qwen_image" in core.registry() and "flashvsr" in core.registry()
+        assert "mmh3" in core.registry() and "mmh3_image" in core.registry()
     finally:
         core._REGISTRY.clear()
 

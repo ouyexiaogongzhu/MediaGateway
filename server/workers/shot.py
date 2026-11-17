@@ -1,14 +1,12 @@
-"""Shot composite worker: image → video → voice → music → ffmpeg mux.
+"""Shot composite worker: video → music → ffmpeg mux.
 
 Orchestrates the other workers in-process, sequentially, inside one job.
 The scheduler sees MEM_GB = max stage (video, 20GB) so a shot render holds
 the GPU exclusively for its whole duration — stages never overlap.
 
 params (every stage optional, but at least one required):
-    image: {prompt, width?, height?, steps?, seed?, input?}
-    video: {prompt, seconds?, steps?, seed?, first_frame?="auto"|path,
-            last_frame?, refs?[], ...}   # "auto" = use generated image
-    voice: {text, voice|speaker, speed?}  # 省略時由 video.prompt 的 <d voice=…> 補
+    video: {prompt, seconds?, steps?, seed?, first_frame?, last_frame?, refs?[]}
+           # mmh3 原生音頻：<d voice="…"> 直接驅動畫內對白/音效，不再需要 TTS 語音階段
     music: {prompt, duration_s?, seed?, lyrics?}
     sfx:   ["ambience_rain"] | [{sfx_tag|"path", start?, loop?, volume?}]
            # 擬音不是階段：sfx_tag 由 mix._pick_sfx 解析成一個檔案，只在 mux 段生效
@@ -22,74 +20,24 @@ import re
 from pathlib import Path
 
 from .. import render
-from . import qwen_image as image_w  # iris 退役後改接 Qwen-Image-2.1（參數同構：prompt/width/height）
 from . import mix as mix_w  # 擬音：複用 mix._pick_sfx 的 sfx_tag 解析器
 from . import music as music_w
 from . import mmh3 as video_w
-from . import voice as voice_w
 
 TYPE = "shot"
 MEM_GB = video_w.MEM_GB  # peak stage
 
-_STAGE_WEIGHTS = {"image": 1, "video": 4, "voice": 1, "music": 1}
+_STAGE_WEIGHTS = {"video": 4, "music": 1}
 
 
-# prompt 內的對白：<d voice="vivian">[Chinese] 台詞</d>
-# 為什麼走 prompt 而不是資料庫：原本的音色來自 character_voice_bindings，而那條鏈要
-# asset_versions → binding → shot_asset_references 三張表都通；實測三張全空，所以
-# 對白從來沒有真的走過 TTS。prompt 早就在傳了（h3 本來就讀 <d>），從裡面取出台詞
-# 與 speaker 可以完全繞開那條斷鏈。voice= 可省略，省略時用 tts_qwen 的預設音色。
-_DIALOGUE_RE = re.compile(
-    r"<d\s*(?:voice=[\"']?([^\"'>\s]+)[\"']?)?\s*>(.*?)</d>", re.S | re.I)
-_LANG_TAG_RE = re.compile(r"^\s*\[([A-Za-z-]+|粵語)\]\s*")
-_YUE_TAGS = frozenset({"cantonese", "yue", "粵語"})
-
-
-def dialogue_from_prompt(prompt: str) -> dict | None:
-    """從 prompt 抽出台詞 → TTS 參數。沒有 <d> 回 None。
-
-    回傳 {"text": ..., "voice": ...}；voice 可能是 None（交給 worker 預設）。
-    [Cantonese]/[粵語]/[yue] 標籤捕獲成 spec["lang"]="yue"（tts_qwen 路由到
-    粵語合併模型），其餘語言標籤照舊只剝除。
-    多段 <d> 依序串接 —— 那是連續發話，h3 也照順序念。
-    """
-    if not prompt or "<d" not in prompt.lower():
-        return None
-    texts, voice, lang = [], None, None
-    for raw_voice, body in _DIALOGUE_RE.findall(prompt):
-        m = _LANG_TAG_RE.match(body)
-        if m and m.group(1).lower() in _YUE_TAGS:
-            lang = "yue"
-        line = _LANG_TAG_RE.sub("", body).strip()
-        if line:
-            texts.append(line)
-        if voice is None and raw_voice:
-            voice = raw_voice.strip()
-    if not texts:
-        return None
-    spec = {"text": " ".join(texts)}
-    if voice:
-        spec["voice"] = voice
-    if lang:
-        spec["lang"] = lang
-    return spec
 
 
 def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     params = dict(params)
-    # prompt 帶 <d> 就自動補一個 voice 階段（呼叫端沒顯式給 voice 時）。
-    if not params.get("voice") and params.get("video"):
-        spec = dialogue_from_prompt((params["video"] or {}).get("prompt") or "")
-        if spec:
-            params["voice"] = spec
-    enabled = [s for s in ("image", "video", "voice", "music") if params.get(s)]
+    # 對白/環境音由 mmh3 原生音頻頭生成（prompt <d> 標籤），無 TTS 語音階段
+    enabled = [s for s in ("video", "music") if params.get(s)]
     if not enabled:
         raise ValueError("at least one of image/video/voice/music is required")
-    # Ref2VA：有台词时 TTS 必须先于视频跑——wav 作为 ref_audio 驱动 h3 口型，
-    # h3 随即自渲染一条干净音轨（见下面 mute_source_audio）
-    if "voice" in enabled and "video" in enabled:
-        enabled.remove("voice")
-        enabled.insert(enabled.index("video"), "voice")
     mix = params.get("mix") or {}
     # 擬音解析提前做：sfx_tag 只是 random.choice 一個檔案，不值得當階段
     # （_STAGE_WEIGHTS 也不必動），但錯 tag 要在燒掉 40 分鐘 GPU 之前就爆
@@ -124,38 +72,11 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if stage == "video" and spec.get("first_frame") == "auto":
-            img = outputs.get("image")
-            if not img:
-                raise ValueError("video.first_frame='auto' needs the image stage")
-            spec["first_frame"] = img["output_path"]
-        if stage == "video" and "voice" in outputs:
-            # 台词 wav 进 refs 驱动口型；顺带归一化影策传来的字符串 refs
-            refs = [{"kind": "image", "path": r} if isinstance(r, str) else r
-                    for r in (spec.get("refs") or [])]
-            # h3.c:633 硬性要求：任何音訊參考都必須配 image 或 video 參考，否則
-            # 整個 job 被拒。但 first_frame/last_frame 是 frame anchor，跟
-            # full reference 互斥（h3 會報 "full references cannot be combined
-            # with frame anchors"）。所以缺視覺參考時把圖當**參考圖**塞進 refs，
-            # 不是當首幀——這也是 Ref2VA 拿到角色外觀的正規途徑。
-            if not any(r.get("kind") in ("image", "video") for r in refs):
-                if spec.get("first_frame"):
-                    refs.insert(0, {"kind": "image", "path": spec.pop("first_frame")})
-                elif not spec.get("last_frame"):
-                    img = outputs.get("image")
-                    if not img:
-                        raise ValueError(
-                            "voice stage needs a visual reference: h3 rejects "
-                            "audio refs without one. Add refs, first_frame, "
-                            "or an image stage.")
-                    refs.insert(0, {"kind": "image", "path": img["output_path"]})
-            refs.append({"kind": "audio", "path": outputs["voice"]["output_path"]})
-            spec["refs"] = refs
-        if stage == "video":
-            video_audio_ref = any(isinstance(r, dict) and r.get("kind") == "audio"
-                                  for r in (spec.get("refs") or []))
+            raise ValueError(
+                "video.first_frame='auto' needs the image stage, which was "
+                "removed with qwen_image; pass an explicit first_frame path")
 
-        module = {"image": image_w, "video": video_w,
-                  "voice": voice_w, "music": music_w}[stage]
+        module = {"video": video_w, "music": music_w}[stage]
         outputs[stage] = module.run(spec, out_dir, stage_cb(stage), cancel)
         meta[stage] = outputs[stage]
         done_w += _STAGE_WEIGHTS[stage]
@@ -173,23 +94,16 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     # 實測對照（512×288 / 4.46s / 同一支 prompt）：
     #   帶 ref-audio → h3 音軌底噪 −75.8dB、時間對齊 r=0.999；無 → −60.0dB。
     # 音軌本身不用，只留它的「表演」。
-    if "voice" in outputs:
-        tracks.append({"path": outputs["voice"]["output_path"], "start": 0})
     if "music" in outputs:  # bed track → mux's music_volume default, loops to video length
         tracks.append({"path": outputs["music"]["output_path"], "loop": True})
     tracks += sfx_tracks  # 擬音鋪最後，音量走 mix.sfx_volume（預設比對白輕）
 
     # 這裡曾經對 h3 的音軌做 Wiener 降噪（power-domain，實測降 7.5–13.7dB）。
-    # h3 音軌改成一律丟棄之後它就是死碼了：render.mux 在 mute_source_audio=True
-    # 時用 anullsrc 當混音底，被降噪的那條軌根本不會進成品。函式本身留在
-    # render.py（仍有測試），只是不再由 shot worker 呼叫。
-
     final = str(job_dir / "shot.mp4")
     render.mux(
         video=vid["output_path"], audio_tracks=tracks, output=final,
-        # 一律丟棄 h3 自渲染的音軌（使用者 2026-10-04 定案：只用 TTS 的聲音）。
-        # 注意這跟 video_audio_ref 無關 —— ref_audio 仍然餵，嘴型要對齊。
-        mute_source_audio=True,
+        # mmh3 原生音頻（對白/環境音/畫內樂）就是成品，保留（2026-11-16）。
+        mute_source_audio=False,
         subtitles=mix.get("subtitles"),
         dialogue_volume=float(mix.get("dialogue_volume", 1.0)),
         music_volume=float(mix.get("music_volume", 0.15)),
