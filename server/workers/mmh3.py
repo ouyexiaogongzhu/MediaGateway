@@ -23,8 +23,10 @@ MEM_GB = 20.0  # 实测峰值 RSS 18.5-19.4GiB（40G 上限内）；+omlx chat 1
 
 BIN = os.environ.get("MMH3_BIN", "/Users/vincent/tool/mmh3/target/release/mmh3")
 MODELS = os.environ.get("MMH3_MODELS", "/Users/vincent/tool/mmh3/models")
+MODELS_ROOT = Path(MODELS)
 BUDGET = int(os.environ.get("MMH3_VRAM_BUDGET", "40"))
 PATCH = "minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors"
+REF2VA_TURBO = "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
 
 
 def _check_file(label: str, path):
@@ -37,9 +39,28 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     prompt = params.get("prompt")
     if not prompt:
         raise ValueError("prompt is required")
-    if params.get("refs"):
-        # Ref2VA DiT (34G) 未下載：磁碟不夠。裝好後把 reference 逐個轉成 --reference 即可。
-        raise ValueError("mmh3 refs not supported yet (ref2va DiT not downloaded)")
+
+    # refs（圖/音）→ Ref2VA DiT 路徑：--reference ≤9 張、--reference-audio ≤3 條，
+    # 官方配方（docs/ref2va.md）= Turbo LoRA 8步 + shift 6/3 + sol attention + sparse-start 0。
+    # FastH3 patch 是 fl2va DiT 的，此路不帶。Metal 無 INT8/FP8 attention → 不傳 precision。
+    ref_files = []
+    audio_files = []
+    for r in params.get("refs") or []:
+        path = r["path"] if isinstance(r, dict) else r
+        kind = r.get("kind", "image") if isinstance(r, dict) else "image"
+        if kind == "image":
+            ref_files.append(_check_file("reference", path))
+        elif kind == "audio":
+            audio_files.append(_check_file("reference audio", path))
+        else:
+            raise ValueError(f"ref kind not supported by mmh3: {kind}")
+    if len(ref_files) > 9:
+        raise ValueError(f"at most 9 reference images (got {len(ref_files)})")
+    if len(audio_files) > 3:
+        raise ValueError(f"at most 3 reference audios (got {len(audio_files)})")
+    ref2va = bool(ref_files or audio_files)
+    if ref2va and not (MODELS_ROOT / "loras" / REF2VA_TURBO).is_file():
+        raise ValueError(f"ref2va needs the Turbo LoRA (loras/{REF2VA_TURBO}) — not downloaded")
 
     width = number(params, "width", 544, 256, 2048, int)
     height = number(params, "height", 960, 256, 2048, int)
@@ -47,15 +68,26 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         frames = max(1, round(float(params["seconds"]) * 24))
     else:
         frames = number(params, "frames", 124, 5, 3600, int)
-    steps = number(params, "steps", 4, 1, 50, int)
+    if ref2va and "steps" not in params:
+        steps = 8  # Turbo LoRA 蒸餾步數
+    else:
+        steps = number(params, "steps", 4, 1, 50, int)
     seed = seed_of(params, 0)
 
     cmd = [BIN, "generate", "--models", MODELS, "--prompt", prompt,
            "--width", str(width), "--height", str(height),
            "--frames", str(frames), "--steps", str(steps), "--seed", str(seed),
            "--vram-budget", str(BUDGET),
-           "--patch", PATCH,
            "--out", job_output(job_dir, params, "output.mp4")]
+    if ref2va:
+        for f in ref_files:
+            cmd += ["--reference", f]
+        for f in audio_files:
+            cmd += ["--reference-audio", f]
+        cmd += ["--lora", REF2VA_TURBO, "--shift-video", "6", "--shift-audio", "3",
+                "--attention", "sol", "--sparse-start", "0"]
+    else:
+        cmd += ["--patch", PATCH]
     if params.get("first_frame"):
         cmd += ["--first-frame", _check_file("first_frame", params["first_frame"])]
     if params.get("last_frame"):
@@ -93,4 +125,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
         raise RuntimeError(f"mmh3 produced no output; log tail:\n{tail}")
     meta = {"engine": "mmh3", "width": width, "height": height,
             "frames": frames, "steps": steps, "seed": seed}
+    if ref2va:
+        meta["mode"] = "ref2va-turbo"
+        meta["refs"] = len(ref_files) + len(audio_files)
     return {"output_path": out, **meta}

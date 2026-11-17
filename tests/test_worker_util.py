@@ -79,6 +79,61 @@ def test_run_cli_timeout():
             raise AssertionError("expected timeout")
 
 
+def test_mmh3_ref2va_cmd_shape(tmp_path):
+    """refs → Ref2VA 路徑：--reference 逐個、Turbo LoRA 8步 shift 6/3 sol、無 --patch。"""
+    from server.workers import mmh3
+
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"PNG")
+    captured = {}
+
+    def fake_run_cli(cmd, **kw):
+        captured["cmd"] = cmd
+        out = kw["log_path"].parent / "output.mp4"
+        out.write_bytes(b"MP4")
+        if kw.get("on_log"):
+            kw["on_log"]("step 8/8\n")
+        return {}
+
+    saved = mmh3.run_cli
+    mmh3.run_cli = fake_run_cli
+    saved_root = mmh3.MODELS_ROOT
+    lora_dir = tmp_path / "loras"
+    lora_dir.mkdir()
+    (lora_dir / mmh3.REF2VA_TURBO).write_bytes(b"LoRA")  # 下載與否不該影響 cmd 形狀測試
+    mmh3.MODELS_ROOT = tmp_path
+    try:
+        res = mmh3.run({"prompt": "dancing", "width": 768, "height": 1344,
+                        "frames": 120, "seed": 3,
+                        "refs": [{"kind": "image", "path": str(ref)},
+                                 {"kind": "image", "path": str(ref)}]},
+                       tmp_path, lambda *a: None, lambda: False)
+        cmd = captured["cmd"]
+        assert cmd.count("--reference") == 2
+        assert mmh3.REF2VA_TURBO in cmd and cmd[cmd.index("--lora") + 1] == mmh3.REF2VA_TURBO
+        assert cmd[cmd.index("--steps") + 1] == "8"          # turbo 蒸餾步數覆蓋缺省 4
+        assert "--patch" not in cmd                          # FastH3 patch 是 fl2va 的
+        assert cmd[cmd.index("--shift-video") + 1] == "6"
+        assert cmd[cmd.index("--attention") + 1] == "sol"
+        assert res["mode"] == "ref2va-turbo"
+        # 純 T2VA 路徑不受影響：仍帶 --patch、預設 4 步
+        mmh3.run({"prompt": "cat", "width": 768, "height": 1344, "frames": 120},
+                 tmp_path, lambda *a: None, lambda: False)
+        cmd2 = captured["cmd"]
+        assert "--patch" in cmd2 and cmd2[cmd2.index("--steps") + 1] == "4"
+        assert "--reference" not in cmd2
+        # >9 張拒絕
+        try:
+            mmh3.run({"prompt": "x", "refs": [{"kind": "image", "path": str(ref)}] * 10},
+                     tmp_path, lambda *a: None, lambda: False)
+            raise AssertionError("expected ValueError")
+        except ValueError as e:
+            assert "9" in str(e)
+    finally:
+        mmh3.run_cli = saved
+        mmh3.MODELS_ROOT = saved_root
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
