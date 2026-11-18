@@ -100,7 +100,7 @@ def test_mmh3_ref2va_cmd_shape(tmp_path):
     saved_root = mmh3.MODELS_ROOT
     lora_dir = tmp_path / "loras"
     lora_dir.mkdir()
-    (lora_dir / mmh3.REF2VA_TURBO).write_bytes(b"LoRA")  # 下載與否不該影響 cmd 形狀測試
+    (lora_dir / mmh3.REF2VA_LORA).write_bytes(b"LoRA")  # 下載與否不該影響 cmd 形狀測試
     mmh3.MODELS_ROOT = tmp_path
     try:
         res = mmh3.run({"prompt": "dancing", "width": 768, "height": 1344,
@@ -110,12 +110,14 @@ def test_mmh3_ref2va_cmd_shape(tmp_path):
                        tmp_path, lambda *a: None, lambda: False)
         cmd = captured["cmd"]
         assert cmd.count("--reference") == 2
-        assert mmh3.REF2VA_TURBO in cmd and cmd[cmd.index("--lora") + 1] == mmh3.REF2VA_TURBO
-        assert cmd[cmd.index("--steps") + 1] == "8"          # turbo 蒸餾步數強制（API 預設 4 不可信）
+        assert cmd[cmd.index("--lora") + 1] == mmh3.REF2VA_LORA
+        assert cmd[cmd.index("--steps") + 1] == "4"          # DMAD 蒸餾步數（API 塞的預設丟棄）
         assert "--patch" not in cmd                          # FastH3 patch 是 fl2va 的
-        assert cmd[cmd.index("--shift-video") + 1] == "6"
+        assert cmd[cmd.index("--shift-video") + 1] == "12"
+        assert cmd[cmd.index("--shift-audio") + 1] == "2"
+        assert cmd[cmd.index("--sampler") + 1] == "renoise"
         assert cmd[cmd.index("--attention") + 1] == "sol"
-        assert res["mode"] == "ref2va-turbo"
+        assert res["mode"] == "ref2va-dmad"
         # 純 T2VA 路徑不受影響：仍帶 --patch、預設 4 步
         mmh3.run({"prompt": "cat", "width": 768, "height": 1344, "frames": 120},
                  tmp_path, lambda *a: None, lambda: False)

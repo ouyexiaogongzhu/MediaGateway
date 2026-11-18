@@ -27,6 +27,8 @@ MODELS_ROOT = Path(MODELS)
 BUDGET = int(os.environ.get("MMH3_VRAM_BUDGET", "40"))
 PATCH = "minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors"
 REF2VA_TURBO = "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+# 生產配方（2026-11-18 目檢定案）：DMAD 4步，8步 turbo 的 -53%（400s vs 843s @768×1344/120f）
+REF2VA_LORA = "minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors"
 
 
 def _check_file(label: str, path):
@@ -59,8 +61,8 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     if len(audio_files) > 3:
         raise ValueError(f"at most 3 reference audios (got {len(audio_files)})")
     ref2va = bool(ref_files or audio_files)
-    if ref2va and not (MODELS_ROOT / "loras" / REF2VA_TURBO).is_file():
-        raise ValueError(f"ref2va needs the Turbo LoRA (loras/{REF2VA_TURBO}) — not downloaded")
+    if ref2va and not (MODELS_ROOT / "loras" / REF2VA_LORA).is_file():
+        raise ValueError(f"ref2va needs the DMAD LoRA (loras/{REF2VA_LORA}) — not downloaded")
 
     width = number(params, "width", 544, 256, 2048, int)
     height = number(params, "height", 960, 256, 2048, int)
@@ -69,7 +71,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     else:
         frames = number(params, "frames", 124, 5, 3600, int)
     if ref2va:
-        steps = 8  # Turbo LoRA 蒸餾配方；JobRequest 預設 4 會被 API 層塞進 params，不可信
+        steps = 4  # DMAD 蒸餾配方；JobRequest 預設 4 會被 API 層塞進 params，不可信
     else:
         steps = number(params, "steps", 4, 1, 50, int)
     seed = seed_of(params, 0)
@@ -84,7 +86,9 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
             cmd += ["--reference", f]
         for f in audio_files:
             cmd += ["--reference-audio", f]
-        cmd += ["--lora", REF2VA_TURBO, "--shift-video", "6", "--shift-audio", "3",
+        # docs/dmad.md 蒸餾配方：4步 shift 12/2 + renoise sampler
+        cmd += ["--lora", REF2VA_LORA, "--shift-video", "12", "--shift-audio", "2",
+                "--sampler", "renoise",
                 "--attention", "sol", "--sparse-start", "0"]
     else:
         cmd += ["--patch", PATCH]
@@ -102,7 +106,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     log = Path(job_dir) / "generate.log"
     # 幀數線性：T2VA 4步 362f 實測 581s；ref2va turbo 8步 120f 走到解碼就要 ~800s。
     # 上限寬鬆，run_cli 內部已有 2s 取消輪詢。
-    timeout = 900 + int(frames) * 3 if ref2va else 600 + int(frames) * 1.5
+    timeout = 900 + int(frames) * 2.5 if ref2va else 600 + int(frames) * 1.5
 
     step_re = re.compile(r"step (\d+)/(\d+)")
     done_flags = {"decoded and submitted": 0.9, "decoded the audio": 0.95}
@@ -127,6 +131,6 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     meta = {"engine": "mmh3", "width": width, "height": height,
             "frames": frames, "steps": steps, "seed": seed}
     if ref2va:
-        meta["mode"] = "ref2va-turbo"
+        meta["mode"] = "ref2va-dmad"
         meta["refs"] = len(ref_files) + len(audio_files)
     return {"output_path": out, **meta}
