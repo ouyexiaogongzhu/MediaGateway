@@ -23,7 +23,6 @@ MEM_GB = 22.0  # 實測峰值 RSS 21.1-22.2GiB
 BIN = os.environ.get("MMH3_BIN", "/Users/vincent/tool/mmh3/target/release/mmh3")
 MODELS = os.environ.get("MMH3_MODELS", "/Users/vincent/tool/mmh3/models")
 BUDGET = int(os.environ.get("MMH3_VRAM_BUDGET", "40"))
-PDMD_LORA = "minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors"
 
 
 def _check_file(label: str, path):
@@ -50,10 +49,6 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     cmd = [BIN, "image", "--models", MODELS, "--prompt", prompt,
            "--width", str(width), "--height", str(height),
            "--seed", str(seed), "--vram-budget", str(BUDGET),
-           # 官方 Faster 配方（docs/image.md §Faster）：PDMD 3步 + Metal int8-fp16
-           # attention。同 4refs/1536×864 實測 733s → 179s（4.1×）。draft-steps
-           # 與 references 互斥（CLI 硬拒），故無 draft 臂。
-           "--steps", "3", "--lora", PDMD_LORA, "--attention-precision", "int8-fp16",
            "--out", out]
     for path in refs:  # 編輯模式：--reference 可重複（至 16）
         cmd += ["--reference", path]
