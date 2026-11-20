@@ -106,6 +106,8 @@ class ImageGenIn(BaseModel):
     n: int = 1
     seed: Optional[int] = None
     variant: Optional[str] = None  # 9b | 9b-base
+    # 分鏡草稿快車道：畫布=請求尺寸（px²，如 1024x576 → 589824），不吃 2048² 放大政策
+    min_generation_area: Optional[int] = None
 
 
 def _parse_size(size: Optional[str]) -> tuple[int, int]:
@@ -163,6 +165,8 @@ async def images_generations(req: ImageGenIn):
             params = {"prompt": req.prompt, "width": width, "height": height}
             if req.seed is not None:
                 params["seed"] = req.seed + i
+            if req.min_generation_area:
+                params["min_generation_area"] = req.min_generation_area
             job = await _wait_job(core.create_job("mmh3_image", params)["id"])
             with open(job["output_path"], "rb") as f:
                 data.append({"b64_json": base64.b64encode(f.read()).decode()})
@@ -209,6 +213,7 @@ async def images_edits(request: Request):
     ctype = request.headers.get("content-type", "")
     raw_body = await request.body()
     mask_data: Optional[bytes] = None
+    min_generation_area = None
     if ctype.startswith("application/json"):
         payload = await request.json()
         prompt = str(payload.get("prompt") or "")
@@ -217,6 +222,7 @@ async def images_edits(request: Request):
         seed = payload.get("seed")
         seed = int(seed) if seed not in (None, "") else None
         n = int(payload.get("n") or 1)
+        min_generation_area = payload.get("min_generation_area")
         images = []
         for it in payload.get("images") or []:
             du = str((it.get("image_url") if isinstance(it, dict) else it) or "")
@@ -245,6 +251,7 @@ async def images_edits(request: Request):
         seed = form.get("seed")
         seed = int(seed) if seed not in (None, "") else None
         n = int(form.get("n") or 1)
+        min_generation_area = form.get("min_generation_area")
         images = []
         for k, v in form.multi_items():
             # 影策 openai-images 插件用字段名 images（复数）；OpenAI 官方约定是 image。
@@ -293,6 +300,8 @@ async def images_edits(request: Request):
                 params = {"prompt": prompt, "width": width, "height": height, "refs": refs}
                 if seed is not None:
                     params["seed"] = seed + i
+                if min_generation_area not in (None, ""):
+                    params["min_generation_area"] = int(min_generation_area)
                 job = await _wait_job(core.create_job("mmh3_image", params)["id"])
                 with open(job["output_path"], "rb") as f:
                     imgs.append({"b64_json": base64.b64encode(f.read()).decode()})

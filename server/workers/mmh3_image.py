@@ -52,6 +52,11 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
            "--out", out]
     for path in refs:  # 編輯模式：--reference 可重複（至 16）
         cmd += ["--reference", path]
+    if params.get("min_generation_area"):
+        # 分鏡草稿快車道：畫布=請求尺寸（默認政策是放大到 2048² 級再縮）。
+        # 無 refs 時成本全隨畫布：1024×576 = 19s vs 預設政策 52s。
+        # 帶 refs 時前 3 步是 ref token 綁定、縮畫布只省 ~17%——別用它。
+        cmd += ["--min-generation-area", str(int(params["min_generation_area"]))]
 
     log = Path(job_dir) / "image.log"
     # 4096² 文檔參考 M6 140s；M5 Pro 預算寬鬆。小尺寸會先在 2048² 畫布生成再縮。
