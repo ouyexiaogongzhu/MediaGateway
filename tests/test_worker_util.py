@@ -101,6 +101,9 @@ def test_mmh3_ref2va_cmd_shape(tmp_path):
     lora_dir = tmp_path / "loras"
     lora_dir.mkdir()
     (lora_dir / mmh3.REF2VA_LORA).write_bytes(b"LoRA")  # 下載與否不該影響 cmd 形狀測試
+    patch_dir = tmp_path / "patches"
+    patch_dir.mkdir()
+    (patch_dir / mmh3.PIH3_PATCH).write_bytes(b"PiH3")
     mmh3.MODELS_ROOT = tmp_path
     try:
         res = mmh3.run({"prompt": "dancing", "width": 768, "height": 1344,
@@ -122,7 +125,8 @@ def test_mmh3_ref2va_cmd_shape(tmp_path):
         mmh3.run({"prompt": "cat", "width": 768, "height": 1344, "frames": 120},
                  tmp_path, lambda *a: None, lambda: False)
         cmd2 = captured["cmd"]
-        assert "--patch" in cmd2 and cmd2[cmd2.index("--steps") + 1] == "4"
+        assert "--schedule" in cmd2 and "pih3" in cmd2  # FL2VA 路徑 = pi-H3 2步
+        assert cmd2[cmd2.index("--steps") + 1] == "2"
         assert "--reference" not in cmd2
         # >9 張拒絕
         try:

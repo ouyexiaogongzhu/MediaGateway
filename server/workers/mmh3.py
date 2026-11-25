@@ -25,7 +25,8 @@ BIN = os.environ.get("MMH3_BIN", "/Users/vincent/tool/mmh3/target/release/mmh3")
 MODELS = os.environ.get("MMH3_MODELS", "/Users/vincent/tool/mmh3/models")
 MODELS_ROOT = Path(MODELS)
 BUDGET = int(os.environ.get("MMH3_VRAM_BUDGET", "40"))
-PATCH = "minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors"
+PATCH = "minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors"  # 退役，留檔名參照
+PIH3_PATCH = "minimax_h3_pih3_2step.safetensors"
 REF2VA_TURBO = "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
 # 生產配方（2026-11-18 目檢定案）：DMAD 4步，8步 turbo 的 -53%（400s vs 843s @768×1344/120f）
 REF2VA_LORA = "minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors"
@@ -73,7 +74,7 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
     if ref2va:
         steps = 4  # DMAD 蒸餾配方；JobRequest 預設 4 會被 API 層塞進 params，不可信
     else:
-        steps = number(params, "steps", 4, 1, 50, int)
+        steps = 2  # pi-H3 蒸餾配方（docs/pih3.md，實測 -40% 於 FastH3 4步VSA）
     seed = seed_of(params, 0)
 
     cmd = [BIN, "generate", "--models", MODELS, "--prompt", prompt,
@@ -91,7 +92,11 @@ def run(params: dict, job_dir: Path, progress, cancel) -> dict:
                 "--sampler", "renoise",
                 "--attention", "sol", "--sparse-start", "0"]
     else:
-        cmd += ["--patch", PATCH]
+        # docs/pih3.md：2步 pih3 schedule（shifts 用預設 12/3）+ sol；FastH3 patch 退役
+        if not (MODELS_ROOT / "patches" / PIH3_PATCH).is_file():
+            raise ValueError(f"pi-H3 patch missing (patches/{PIH3_PATCH})")
+        cmd += ["--schedule", "pih3", "--attention", "sol", "--sparse-start", "0",
+                "--patch", PIH3_PATCH]
     if params.get("first_frame"):
         cmd += ["--first-frame", _check_file("first_frame", params["first_frame"])]
     if params.get("last_frame"):
